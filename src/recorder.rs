@@ -348,6 +348,46 @@ impl Worker {
             .map_err(|e| format!("テイクフォルダを作れません: {e}"))?;
         take::create_marker(&dir).map_err(|e| format!("テイクフォルダに書き込めません: {e}"))?;
 
+        let (tracks, meta) = match self.open_files(&dir, request, origin, preroll_frames) {
+            Ok(opened) => opened,
+            Err(msg) => {
+                // Files already created are closed (empty) on drop; without the marker the
+                // next launch does not mistake this aborted take for a crashed one.
+                if let Err(e) = take::remove_marker(&dir) {
+                    log::warn!("could not remove marker of aborted take: {e}");
+                }
+                return Err(msg);
+            }
+        };
+
+        let now = Instant::now();
+        self.take = Some(ActiveTake {
+            dir: dir.clone(),
+            tracks,
+            meta,
+            dropped_at_start: self.dropped_frames.load(Ordering::Relaxed),
+            last_header: now,
+            last_sync: now,
+            last_disk_check: now,
+        });
+        self.shared.frames.store(0, Ordering::Relaxed);
+        self.shared.recording.store(true, Ordering::Relaxed);
+        log::info!("take started: {}", dir.display());
+        self.emit(RecorderEvent::Started { dir });
+        if !preroll.is_empty() {
+            self.write(&preroll);
+        }
+        Ok(())
+    }
+
+    /// Creates one WAV per track plus `take.json` inside an already created take folder.
+    fn open_files(
+        &self,
+        dir: &Path,
+        request: TakeRequest,
+        origin: NaiveDateTime,
+        preroll_frames: u64,
+    ) -> Result<(Vec<OpenTrack>, TakeMeta), String> {
         let mut tracks = Vec::with_capacity(request.tracks.len());
         let mut track_meta = Vec::with_capacity(request.tracks.len());
         for (i, t) in request.tracks.iter().enumerate() {
@@ -358,7 +398,7 @@ impl Worker {
                 sample_rate: self.config.sample_rate,
                 format: request.format,
             };
-            let bext = bext_for(origin, self.config.sample_rate, &dir, &t.name);
+            let bext = bext_for(origin, self.config.sample_rate, dir, &t.name);
             let writer = WavWriter::create(&path, spec, &bext, i as u32)
                 .map_err(|e| format!("{} を作れません: {e}", path.display()))?;
             track_meta.push(TrackMeta {
@@ -387,26 +427,8 @@ impl Worker {
             dropped_frames: 0,
             recovered: false,
         };
-        take::write_meta(&dir, &meta).map_err(|e| format!("take.json を書けません: {e}"))?;
-
-        let now = Instant::now();
-        self.take = Some(ActiveTake {
-            dir: dir.clone(),
-            tracks,
-            meta,
-            dropped_at_start: self.dropped_frames.load(Ordering::Relaxed),
-            last_header: now,
-            last_sync: now,
-            last_disk_check: now,
-        });
-        self.shared.frames.store(0, Ordering::Relaxed);
-        self.shared.recording.store(true, Ordering::Relaxed);
-        log::info!("take started: {}", dir.display());
-        self.emit(RecorderEvent::Started { dir });
-        if !preroll.is_empty() {
-            self.write(&preroll);
-        }
-        Ok(())
+        take::write_meta(dir, &meta).map_err(|e| format!("take.json を書けません: {e}"))?;
+        Ok((tracks, meta))
     }
 
     /// Reads every whole frame currently in the ring. Returns the number of samples read.
