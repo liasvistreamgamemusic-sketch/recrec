@@ -20,7 +20,7 @@ const CONFIG_SAVE_DELAY: Duration = Duration::from_secs(1);
 const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_MESSAGES: usize = 50;
 const TAKE_LIST_LIMIT: usize = 50;
-pub(super) const REPAINT_INTERVAL: Duration = Duration::from_millis(33);
+pub(super) const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Level {
@@ -34,6 +34,8 @@ pub(super) struct Message {
     pub level: Level,
     pub text: String,
     pub at: DateTime<Local>,
+    /// Monotonic creation time, used to time toast animations.
+    pub born: Instant,
 }
 
 pub struct RecrecApp {
@@ -57,6 +59,9 @@ pub struct RecrecApp {
     sleep_guard: Option<SleepGuard>,
     pub(super) messages: Vec<Message>,
     pub(super) free_space: Option<u64>,
+    pub(super) total_space: Option<u64>,
+    /// Horizontal extent of the track meters in the last frame (aligns the dB scale).
+    pub(super) meter_span: Option<(f32, f32)>,
     last_space_check: Option<Instant>,
     pub(super) pending_drag: Option<Vec<PathBuf>>,
 }
@@ -94,6 +99,8 @@ impl RecrecApp {
             sleep_guard: None,
             messages: Vec::new(),
             free_space: None,
+            total_space: None,
+            meter_span: None,
             last_space_check: None,
             pending_drag: None,
         };
@@ -118,6 +125,7 @@ impl RecrecApp {
             level,
             text,
             at: Local::now(),
+            born: Instant::now(),
         });
         if self.messages.len() > MAX_MESSAGES {
             self.messages.remove(0);
@@ -493,6 +501,7 @@ impl RecrecApp {
                     .unwrap_or(dir)
             };
             self.free_space = fs2::available_space(&probe).ok();
+            self.total_space = fs2::total_space(&probe).ok();
         }
 
         if self

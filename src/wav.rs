@@ -54,6 +54,15 @@ impl SampleFormat {
         }
     }
 
+    /// Compact label for tight spaces (segmented control, take cards).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Pcm16 => "16-bit",
+            Self::Pcm24 => "24-bit",
+            Self::Float32 => "32-bit float",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Pcm16 => "16-bit PCM",

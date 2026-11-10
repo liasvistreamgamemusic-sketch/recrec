@@ -119,7 +119,7 @@ mod tests {
         let path = dir.path().join("sub").join(CONFIG_FILE);
         let mut cfg = AppConfig {
             host: Some("ASIO".into()),
-            device: Some("MOTU M Series".into()),
+            device: Some("Audio Interface".into()),
             sample_rate: Some(96_000),
             buffer_size: Some(256),
             format: SampleFormat::Float32,
@@ -128,7 +128,7 @@ mod tests {
             tracks: BTreeMap::new(),
         };
         cfg.tracks.insert(
-            device_key("ASIO", "MOTU M Series"),
+            device_key("ASIO", "Audio Interface"),
             vec![Track {
                 name: "Synth".into(),
                 source: Source::Stereo(2, 3),

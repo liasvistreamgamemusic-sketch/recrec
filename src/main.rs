@@ -74,15 +74,18 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("recrec {}", env!("CARGO_PKG_VERSION")))
-            .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([640.0, 480.0])
+            .with_inner_size([1360.0, 840.0])
+            .with_min_inner_size([1280.0, 680.0])
             .with_icon(app_icon()),
         ..Default::default()
     };
     let result = eframe::run_native(
         "recrec",
         options,
-        Box::new(|_cc| Ok(Box::new(RecrecApp::launch()))),
+        Box::new(|cc| {
+            recrec::ui::install_theme(&cc.egui_ctx);
+            Ok(Box::new(RecrecApp::launch()))
+        }),
     );
     if let Err(e) = &result {
         log::error!("UI terminated with error: {e}");

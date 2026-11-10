@@ -273,7 +273,7 @@ mod tests {
         TakeMeta {
             app_version: "0.1.0".into(),
             host: "ASIO".into(),
-            device: "MOTU M Series".into(),
+            device: "Audio Interface".into(),
             sample_rate: 48_000,
             format: SampleFormat::Pcm24,
             started_at: "2026-11-10T22:30:15".into(),
