@@ -1,0 +1,17 @@
+{
+  "skill_name": "quality-audit",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "minutesai プロジェクトの backend/app/utils だけを対象に、コード品質の監査をドライラン(レポートのみ、修正なし)で実行して",
+      "expected_output": "全7ファイルのカバレッジ100%が明記され、次元別 findings (根拠つき)・偽陽性検証結果・修正計画・見送り推奨を含む監査レポート。ブランチ作成や修正は行われない",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "このプロジェクトにセキュリティの問題やコミットされてしまった secrets がないか、リポジトリ全体を洗い出して。修正はまだしなくていいのでレポートが欲しい",
+      "expected_output": "ツール事前スキャン (gitleaks / 依存脆弱性監査等、使えたツールと使えなかったツールの明記) と精読の両方に基づく security / hygiene findings。secrets の値は必ずマスクされ、severity=high の finding には入力経路の到達性検証 (Layer C) の結果が付く。dry-run なので修正・ブランチ作成は行われない",
+      "files": []
+    }
+  ]
+}
