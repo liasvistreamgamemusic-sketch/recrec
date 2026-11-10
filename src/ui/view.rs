@@ -336,15 +336,12 @@ impl RecrecApp {
             String::new()
         };
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{}  空き {}",
-                    icon::HARD_DRIVES,
-                    format_bytes(free)
-                ))
-                .font(theme::regular(theme::TEXT_SMALL))
-                .color(theme::INK_SUBTLE),
-            );
+            ui.label(theme::with_icon(
+                icon::HARD_DRIVES,
+                &format!("空き {}", format_bytes(free)),
+                theme::regular(theme::TEXT_SMALL),
+                theme::INK_SUBTLE,
+            ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
                     RichText::new(remaining)
@@ -485,7 +482,12 @@ impl RecrecApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_enabled_ui(!busy && self.session.is_some(), |ui| {
                     if ui
-                        .button(format!("{}  追加", icon::PLUS))
+                        .button(theme::with_icon(
+                            icon::PLUS,
+                            "追加",
+                            theme::medium(theme::TEXT_BODY),
+                            theme::INK_MUTED,
+                        ))
                         .on_hover_text("トラックを 1 つ追加します")
                         .clicked()
                     {
@@ -493,8 +495,13 @@ impl RecrecApp {
                     }
                     if ui
                         .add(
-                            Button::new(format!("{}  リセット", icon::ARROW_COUNTER_CLOCKWISE))
-                                .frame(false),
+                            Button::new(theme::with_icon(
+                                icon::ARROW_COUNTER_CLOCKWISE,
+                                "リセット",
+                                theme::medium(theme::TEXT_BODY),
+                                theme::INK_SUBTLE,
+                            ))
+                            .frame(false),
                         )
                         .on_hover_text("入力 1 ch ごとにモノラル 1 トラックの構成に戻します")
                         .clicked()
@@ -691,11 +698,12 @@ impl RecrecApp {
 
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{}  Space で録音 / 停止", icon::KEYBOARD))
-                    .font(theme::regular(theme::TEXT_SMALL))
-                    .color(theme::INK_TERTIARY),
-            );
+            ui.label(theme::with_icon(
+                icon::KEYBOARD,
+                "Space で録音 / 停止",
+                theme::regular(theme::TEXT_SMALL),
+                theme::INK_TERTIARY,
+            ));
             if let Some(s) = &self.session {
                 let dropped = if self.recording_dir.is_some() {
                     s.dropped_frames().saturating_sub(self.dropped_at_take_start)
@@ -703,11 +711,12 @@ impl RecrecApp {
                     s.dropped_frames()
                 };
                 if dropped > 0 {
-                    ui.label(
-                        RichText::new(format!("{}  取りこぼし {dropped} フレーム", icon::WARNING))
-                            .font(theme::medium(theme::TEXT_SMALL))
-                            .color(theme::REC),
-                    )
+                    ui.label(theme::with_icon(
+                        icon::WARNING,
+                        &format!("取りこぼし {dropped} フレーム"),
+                        theme::medium(theme::TEXT_SMALL),
+                        theme::REC,
+                    ))
                     .on_hover_text(
                         "書き込みが追いつかず捨てたフレーム数です。バッファを大きくするか、他の負荷を減らしてください",
                     );
@@ -715,9 +724,12 @@ impl RecrecApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button(
-                    RichText::new(format!("{}  履歴", icon::BELL))
-                        .font(theme::regular(theme::TEXT_SMALL))
-                        .color(theme::INK_SUBTLE),
+                    theme::with_icon(
+                        icon::BELL,
+                        "履歴",
+                        theme::regular(theme::TEXT_SMALL),
+                        theme::INK_SUBTLE,
+                    ),
                     |ui| {
                         ui.set_min_width(420.0);
                         ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
@@ -762,8 +774,9 @@ impl RecrecApp {
             .order(Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
-                    for (m, opacity) in live {
+                ui.vertical(|ui| {
+                    // Oldest first, so the newest toast sits nearest the corner.
+                    for (m, opacity) in live.into_iter().rev() {
                         ui.scope(|ui| {
                             ui.set_opacity(opacity);
                             ui.add_space((1.0 - opacity) * 10.0);
@@ -777,7 +790,7 @@ impl RecrecApp {
                                     ui.horizontal_top(|ui| {
                                         ui.label(
                                             RichText::new(level_icon(m.level))
-                                                .font(theme::regular(theme::ICON_SIZE))
+                                                .font(theme::icons(theme::ICON_SIZE))
                                                 .color(level_color(m.level)),
                                         );
                                         ui.add(
@@ -829,7 +842,7 @@ fn take_card(
                         .add(
                             Label::new(
                                 RichText::new(icon::DOTS_SIX_VERTICAL)
-                                    .font(theme::regular(theme::ICON_SIZE))
+                                    .font(theme::icons(theme::ICON_SIZE))
                                     .color(theme::mix(
                                         theme::INK_TERTIARY,
                                         theme::INK_MUTED,
@@ -921,7 +934,7 @@ fn empty_state(ui: &mut Ui, glyph: &str, title: &str, hint: &str) {
     ui.vertical_centered(|ui| {
         ui.label(
             RichText::new(glyph)
-                .font(theme::regular(36.0))
+                .font(theme::icons(36.0))
                 .color(theme::INK_TERTIARY),
         );
         ui.label(

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{
-    self, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id,
-    Margin, Stroke, TextStyle, Vec2, style::WidgetVisuals,
+    self, Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id,
+    Margin, Stroke, TextFormat, TextStyle, Vec2, style::WidgetVisuals, text::LayoutJob,
 };
 
 // ---- color -------------------------------------------------------------------------------
@@ -47,6 +47,7 @@ pub const RADIUS_LG: u8 = 12;
 const FAMILY_MEDIUM: &str = "inter-medium";
 const FAMILY_SEMIBOLD: &str = "inter-semibold";
 const FAMILY_MONO: &str = "jetbrains-mono";
+const FAMILY_ICONS: &str = "phosphor-icons";
 pub const TEXT_SMALL: f32 = 11.5;
 pub const TEXT_BODY: f32 = 13.5;
 pub const TEXT_TITLE: f32 = 15.0;
@@ -68,6 +69,25 @@ pub fn semibold(size: f32) -> FontId {
 
 pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(FAMILY_MONO.into()))
+}
+
+/// Font for the glyphs in [`icon`].
+pub fn icons(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(FAMILY_ICONS.into()))
+}
+
+/// An icon followed by text, as one piece of laid-out text (for buttons and labels).
+pub fn with_icon(glyph: &str, text: &str, font: FontId, color: Color32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let format = |font_id: FontId| TextFormat {
+        font_id,
+        color,
+        valign: Align::Center,
+        ..Default::default()
+    };
+    job.append(glyph, 0.0, format(icons(font.size + 2.0)));
+    job.append(text, 6.0, format(font));
+    job
 }
 
 // ---- motion ------------------------------------------------------------------------------
@@ -153,8 +173,7 @@ fn fonts() -> FontDefinitions {
         .cloned()
         .unwrap_or_default();
     let family = |primary: &str| {
-        // Icons first: Inter maps some of the same private-use codepoints to its own glyphs.
-        let mut list = vec![ICONS.to_owned(), primary.to_owned()];
+        let mut list = vec![primary.to_owned()];
         list.extend(builtin.iter().cloned());
         list
     };
@@ -162,6 +181,12 @@ fn fonts() -> FontDefinitions {
         .insert(FontFamily::Proportional, family("inter-regular"));
     defs.families
         .insert(FontFamily::Monospace, family(FAMILY_MONO));
+    // Icons get their own family: Inter and Phosphor both claim private-use codepoints, so
+    // neither may be a fallback of the other.
+    defs.families.insert(
+        FontFamily::Name(FAMILY_ICONS.into()),
+        vec![ICONS.to_owned()],
+    );
     for name in [FAMILY_MEDIUM, FAMILY_SEMIBOLD, FAMILY_MONO] {
         defs.families
             .insert(FontFamily::Name(name.into()), family(name));

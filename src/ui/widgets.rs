@@ -328,7 +328,7 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str, danger: bool) -> Res
         rect.center(),
         Align2::CENTER_CENTER,
         glyph,
-        theme::regular(theme::ICON_SIZE),
+        theme::icons(theme::ICON_SIZE),
         theme::mix(base, target, hover),
     );
     response
@@ -398,9 +398,13 @@ pub fn segmented(ui: &mut Ui, id: egui::Id, labels: &[&str], selected: usize) ->
 
 /// A draggable file chip. Returns its response (check `drag_started`).
 pub fn file_chip(ui: &mut Ui, name: &str, draggable: bool, tooltip: &str) -> Response {
-    let font = theme::regular(theme::TEXT_SMALL + 0.5);
-    let text = format!("{}  {name}", icon::FILE_AUDIO);
-    let galley = ui.painter().layout_no_wrap(text, font, theme::INK_MUTED);
+    let job = theme::with_icon(
+        icon::FILE_AUDIO,
+        name,
+        theme::regular(theme::TEXT_SMALL + 0.5),
+        theme::INK_MUTED,
+    );
+    let galley = ui.painter().layout_job(job);
     let padding = Vec2::new(theme::SPACE_XS, 5.0);
     let (rect, response) =
         ui.allocate_exact_size(galley.size() + padding * 2.0, Sense::click_and_drag());
@@ -420,11 +424,8 @@ pub fn file_chip(ui: &mut Ui, name: &str, draggable: bool, tooltip: &str) -> Res
         ),
         StrokeKind::Inside,
     );
-    ui.painter().galley_with_override_text_color(
-        rect.min + padding,
-        galley,
-        theme::mix(theme::INK_MUTED, theme::INK, hover),
-    );
+    ui.painter()
+        .galley(rect.min + padding, galley, theme::INK_MUTED);
     let response = response.on_hover_text(tooltip);
     if draggable {
         response.on_hover_cursor(CursorIcon::Grab)
