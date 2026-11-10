@@ -1,0 +1,43 @@
+[package]
+name = "recrec"
+version = "0.1.0"
+edition = "2024"
+description = "Multichannel recorder for musicians: records every input of an audio interface to its own WAV file"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/liasvistreamgamemusic-sketch/recrec"
+publish = false
+
+[features]
+default = []
+# Steinberg ASIO support (Windows only). Needs LLVM/libclang at build time.
+asio = ["cpal/asio"]
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+cpal = "0.18"
+crossbeam-channel = "0.5"
+directories = "6"
+eframe = "0.37"
+fs2 = "0.4"
+log = "0.4"
+rfd = "0.18"
+rtrb = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simplelog = "0.12"
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+drag = "2"
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

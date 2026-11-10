@@ -1,0 +1,840 @@
+//! The writer thread: drains the capture ring, keeps the pre-roll, and writes takes to disk.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use chrono::{Local, NaiveDateTime, TimeDelta};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+
+use crate::take::{self, TakeMeta, TrackMeta};
+use crate::wav::{Bext, SampleFormat, WavSpec, WavWriter};
+
+pub const MAX_PREROLL_SECS: u32 = 30;
+
+/// Timing and safety thresholds of the writer thread.
+#[derive(Debug, Clone)]
+pub struct RecorderConfig {
+    pub channels: usize,
+    pub sample_rate: u32,
+    pub header_interval: Duration,
+    pub sync_interval: Duration,
+    pub disk_check_interval: Duration,
+    pub min_free_bytes: u64,
+    pub poll_interval: Duration,
+}
+
+impl RecorderConfig {
+    pub fn new(channels: usize, sample_rate: u32) -> Self {
+        Self {
+            channels,
+            sample_rate,
+            header_interval: Duration::from_secs(1),
+            sync_interval: Duration::from_secs(5),
+            disk_check_interval: Duration::from_secs(2),
+            min_free_bytes: 256 * 1024 * 1024,
+            poll_interval: Duration::from_millis(5),
+        }
+    }
+}
+
+/// One output file of a take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackRequest {
+    pub name: String,
+    /// 0-based device channels, in file channel order.
+    pub channels: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TakeRequest {
+    pub root: PathBuf,
+    pub label: String,
+    pub tracks: Vec<TrackRequest>,
+    pub format: SampleFormat,
+    pub host: String,
+    pub device: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TakeSummary {
+    pub dir: PathBuf,
+    pub files: Vec<PathBuf>,
+    pub frames: u64,
+    pub dropped_frames: u64,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecorderEvent {
+    Started {
+        dir: PathBuf,
+    },
+    Stopped(TakeSummary),
+    /// User-facing message (Japanese).
+    Error(String),
+}
+
+enum Command {
+    Start(TakeRequest),
+    Stop,
+    SetPreRoll(u32),
+    Shutdown,
+}
+
+#[derive(Debug, Default)]
+struct Shared {
+    recording: AtomicBool,
+    frames: AtomicU64,
+}
+
+/// UI-side handle; dropping it stops any take and joins the thread.
+pub struct Recorder {
+    commands: Sender<Command>,
+    events: Receiver<RecorderEvent>,
+    shared: Arc<Shared>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Recorder {
+    pub fn spawn(
+        consumer: rtrb::Consumer<f32>,
+        config: RecorderConfig,
+        dropped_frames: Arc<AtomicU64>,
+    ) -> std::io::Result<Self> {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let shared = Arc::new(Shared::default());
+        let worker = Worker {
+            consumer,
+            commands: cmd_rx,
+            events: ev_tx,
+            shared: shared.clone(),
+            dropped_frames,
+            scratch: Vec::new(),
+            preroll: PreRoll::new(0),
+            take: None,
+            config,
+        };
+        let thread = thread::Builder::new()
+            .name("recrec-writer".into())
+            .spawn(move || worker.run())?;
+        Ok(Self {
+            commands: cmd_tx,
+            events: ev_rx,
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn start(&self, request: TakeRequest) {
+        self.send(Command::Start(request));
+    }
+
+    pub fn stop(&self) {
+        self.send(Command::Stop);
+    }
+
+    pub fn set_preroll(&self, secs: u32) {
+        self.send(Command::SetPreRoll(secs.min(MAX_PREROLL_SECS)));
+    }
+
+    fn send(&self, cmd: Command) {
+        if self.commands.send(cmd).is_err() {
+            log::error!("writer thread is gone; command dropped");
+        }
+    }
+
+    pub fn try_event(&self) -> Option<RecorderEvent> {
+        self.events.try_recv().ok()
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.shared.recording.load(Ordering::Relaxed)
+    }
+
+    pub fn frames_recorded(&self) -> u64 {
+        self.shared.frames.load(Ordering::Relaxed)
+    }
+
+    /// Stops any take, waits for the files to be closed, and returns the remaining events.
+    pub fn shutdown(mut self) -> Vec<RecorderEvent> {
+        self.join();
+        self.events.try_iter().collect()
+    }
+
+    fn join(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // If the thread already exited the channel is closed; joining is all that is left.
+            let _ = self.commands.send(Command::Shutdown);
+            if thread.join().is_err() {
+                log::error!("writer thread panicked");
+            }
+        }
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+/// Fixed-capacity history of the most recent interleaved samples.
+struct PreRoll {
+    samples: VecDeque<f32>,
+    capacity: usize,
+}
+
+impl PreRoll {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, interleaved: &[f32]) {
+        if self.capacity == 0 {
+            return;
+        }
+        let keep = &interleaved[interleaved.len().saturating_sub(self.capacity)..];
+        let overflow = (self.samples.len() + keep.len()).saturating_sub(self.capacity);
+        self.samples.drain(..overflow);
+        self.samples.extend(keep);
+    }
+
+    fn take(&mut self) -> Vec<f32> {
+        self.samples.drain(..).collect()
+    }
+}
+
+struct OpenTrack {
+    writer: WavWriter,
+    channels: Vec<usize>,
+    path: PathBuf,
+    buf: Vec<f32>,
+}
+
+struct ActiveTake {
+    dir: PathBuf,
+    tracks: Vec<OpenTrack>,
+    meta: TakeMeta,
+    dropped_at_start: u64,
+    last_header: Instant,
+    last_sync: Instant,
+    last_disk_check: Instant,
+}
+
+struct Worker {
+    consumer: rtrb::Consumer<f32>,
+    commands: Receiver<Command>,
+    events: Sender<RecorderEvent>,
+    shared: Arc<Shared>,
+    dropped_frames: Arc<AtomicU64>,
+    scratch: Vec<f32>,
+    preroll: PreRoll,
+    take: Option<ActiveTake>,
+    config: RecorderConfig,
+}
+
+enum Flow {
+    Continue,
+    Exit,
+}
+
+impl Worker {
+    fn run(mut self) {
+        loop {
+            loop {
+                match self.commands.try_recv() {
+                    Ok(cmd) => {
+                        if let Flow::Exit = self.handle(cmd) {
+                            return;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.handle(Command::Shutdown);
+                        return;
+                    }
+                }
+            }
+            let got = self.drain();
+            self.periodic();
+            if got == 0 {
+                match self.commands.recv_timeout(self.config.poll_interval) {
+                    Ok(cmd) => {
+                        if let Flow::Exit = self.handle(cmd) {
+                            return;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.handle(Command::Shutdown);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle(&mut self, cmd: Command) -> Flow {
+        match cmd {
+            Command::Start(request) => {
+                if self.take.is_some() {
+                    log::warn!("start requested while already recording; ignored");
+                } else if let Err(msg) = self.start(request) {
+                    log::error!("could not start take: {msg}");
+                    self.emit(RecorderEvent::Error(msg));
+                }
+            }
+            Command::Stop => {
+                self.drain();
+                self.stop(None);
+            }
+            Command::SetPreRoll(secs) => {
+                let samples =
+                    secs as usize * self.config.sample_rate as usize * self.config.channels;
+                self.preroll = PreRoll::new(samples);
+            }
+            Command::Shutdown => {
+                self.drain();
+                self.stop(None);
+                return Flow::Exit;
+            }
+        }
+        Flow::Continue
+    }
+
+    fn emit(&self, event: RecorderEvent) {
+        if self.events.send(event).is_err() {
+            log::warn!("UI is gone; recorder event dropped");
+        }
+    }
+
+    fn start(&mut self, request: TakeRequest) -> Result<(), String> {
+        if request.tracks.is_empty() {
+            return Err("録音するトラックがありません".into());
+        }
+        if let Some(bad) = request
+            .tracks
+            .iter()
+            .flat_map(|t| &t.channels)
+            .find(|&&c| c >= self.config.channels)
+        {
+            return Err(format!("入力 {} はこのデバイスにありません", bad + 1));
+        }
+        std::fs::create_dir_all(&request.root).map_err(|e| {
+            format!(
+                "出力先フォルダを作れません ({}): {e}",
+                request.root.display()
+            )
+        })?;
+        check_free_space(&request.root, self.config.min_free_bytes)?;
+
+        let preroll = self.preroll.take();
+        let preroll_frames = (preroll.len() / self.config.channels) as u64;
+        let now = Local::now().naive_local();
+        let origin = now
+            - TimeDelta::microseconds(
+                (preroll_frames as f64 / f64::from(self.config.sample_rate) * 1e6) as i64,
+            );
+
+        let dir = take::create_take_dir(&request.root, now, &request.label)
+            .map_err(|e| format!("テイクフォルダを作れません: {e}"))?;
+        take::create_marker(&dir).map_err(|e| format!("テイクフォルダに書き込めません: {e}"))?;
+
+        let mut tracks = Vec::with_capacity(request.tracks.len());
+        let mut track_meta = Vec::with_capacity(request.tracks.len());
+        for (i, t) in request.tracks.iter().enumerate() {
+            let file = take::track_file_name(i, &t.name);
+            let path = dir.join(&file);
+            let spec = WavSpec {
+                channels: t.channels.len() as u16,
+                sample_rate: self.config.sample_rate,
+                format: request.format,
+            };
+            let bext = bext_for(origin, self.config.sample_rate, &dir, &t.name);
+            let writer = WavWriter::create(&path, spec, &bext, i as u32)
+                .map_err(|e| format!("{} を作れません: {e}", path.display()))?;
+            track_meta.push(TrackMeta {
+                name: t.name.clone(),
+                inputs: t.channels.iter().map(|&c| c as u16 + 1).collect(),
+                file,
+            });
+            tracks.push(OpenTrack {
+                writer,
+                channels: t.channels.clone(),
+                path,
+                buf: Vec::new(),
+            });
+        }
+
+        let meta = TakeMeta {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            host: request.host,
+            device: request.device,
+            sample_rate: self.config.sample_rate,
+            format: request.format,
+            started_at: origin.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+            tracks: track_meta,
+            frames: 0,
+            preroll_frames,
+            dropped_frames: 0,
+            recovered: false,
+        };
+        take::write_meta(&dir, &meta).map_err(|e| format!("take.json を書けません: {e}"))?;
+
+        let now = Instant::now();
+        self.take = Some(ActiveTake {
+            dir: dir.clone(),
+            tracks,
+            meta,
+            dropped_at_start: self.dropped_frames.load(Ordering::Relaxed),
+            last_header: now,
+            last_sync: now,
+            last_disk_check: now,
+        });
+        self.shared.frames.store(0, Ordering::Relaxed);
+        self.shared.recording.store(true, Ordering::Relaxed);
+        log::info!("take started: {}", dir.display());
+        self.emit(RecorderEvent::Started { dir });
+        if !preroll.is_empty() {
+            self.write(&preroll);
+        }
+        Ok(())
+    }
+
+    /// Reads every whole frame currently in the ring. Returns the number of samples read.
+    fn drain(&mut self) -> usize {
+        let channels = self.config.channels;
+        let available = self.consumer.slots();
+        let n = available - available % channels;
+        if n == 0 {
+            return 0;
+        }
+        let Ok(chunk) = self.consumer.read_chunk(n) else {
+            return 0;
+        };
+        let (a, b) = chunk.as_slices();
+        self.scratch.clear();
+        self.scratch.extend_from_slice(a);
+        self.scratch.extend_from_slice(b);
+        chunk.commit_all();
+
+        let samples = std::mem::take(&mut self.scratch);
+        if self.take.is_some() {
+            self.write(&samples);
+        } else {
+            self.preroll.push(&samples);
+        }
+        self.scratch = samples;
+        n
+    }
+
+    fn write(&mut self, interleaved: &[f32]) {
+        let channels = self.config.channels;
+        let Some(take) = self.take.as_mut() else {
+            return;
+        };
+        let mut failure = None;
+        for track in &mut take.tracks {
+            track.buf.clear();
+            for frame in interleaved.chunks_exact(channels) {
+                track.buf.extend(track.channels.iter().map(|&c| frame[c]));
+            }
+            if let Err(e) = track.writer.write_samples(&track.buf) {
+                failure = Some(format!(
+                    "{} への書き込みに失敗しました: {e}",
+                    track.path.display()
+                ));
+                break;
+            }
+        }
+        if let Some(first) = take.tracks.first() {
+            self.shared
+                .frames
+                .store(first.writer.frames_written(), Ordering::Relaxed);
+        }
+        if let Some(msg) = failure {
+            self.stop(Some(msg));
+        }
+    }
+
+    fn periodic(&mut self) {
+        let Some(take) = self.take.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let mut failure = None;
+        if now - take.last_header >= self.config.header_interval {
+            take.last_header = now;
+            for t in &mut take.tracks {
+                if let Err(e) = t.writer.flush_header() {
+                    failure = Some(format!("{} の更新に失敗しました: {e}", t.path.display()));
+                }
+            }
+        }
+        if failure.is_none() && now - take.last_sync >= self.config.sync_interval {
+            take.last_sync = now;
+            for t in &mut take.tracks {
+                if let Err(e) = t.writer.sync() {
+                    failure = Some(format!(
+                        "{} の書き込みに失敗しました: {e}",
+                        t.path.display()
+                    ));
+                }
+            }
+        }
+        if failure.is_none() && now - take.last_disk_check >= self.config.disk_check_interval {
+            take.last_disk_check = now;
+            if let Err(msg) = check_free_space(&take.dir, self.config.min_free_bytes) {
+                failure = Some(msg);
+            }
+        }
+        if let Some(msg) = failure {
+            self.stop(Some(msg));
+        }
+    }
+
+    /// Closes the active take, if any. `failure` is reported to the UI as an error.
+    fn stop(&mut self, failure: Option<String>) {
+        let Some(mut take) = self.take.take() else {
+            return;
+        };
+        self.shared.recording.store(false, Ordering::Relaxed);
+        let mut errors: Vec<String> = failure.iter().cloned().collect();
+        let frames = take.tracks.first().map_or(0, |t| t.writer.frames_written());
+        let mut files = Vec::with_capacity(take.tracks.len());
+        for t in &mut take.tracks {
+            if let Err(e) = t.writer.finalize() {
+                errors.push(format!("{} を閉じられません: {e}", t.path.display()));
+            }
+            files.push(t.path.clone());
+        }
+        let dropped = self
+            .dropped_frames
+            .load(Ordering::Relaxed)
+            .saturating_sub(take.dropped_at_start);
+        take.meta.frames = frames;
+        take.meta.dropped_frames = dropped;
+        if let Err(e) = take::write_meta(&take.dir, &take.meta) {
+            errors.push(format!("take.json を書けません: {e}"));
+        }
+        // Keep the marker on failure so the next launch repairs the files.
+        if errors.is_empty()
+            && let Err(e) = take::remove_marker(&take.dir)
+        {
+            errors.push(format!("録音中マーカーを消せません: {e}"));
+        }
+        log::info!(
+            "take stopped: {} ({frames} frames, {dropped} dropped, {} errors)",
+            take.dir.display(),
+            errors.len()
+        );
+        for e in &errors {
+            log::error!("{e}");
+        }
+        if let Some(msg) = failure {
+            self.emit(RecorderEvent::Error(msg));
+        }
+        self.emit(RecorderEvent::Stopped(TakeSummary {
+            dir: take.dir,
+            files,
+            frames,
+            dropped_frames: dropped,
+            errors,
+        }));
+    }
+}
+
+fn bext_for(origin: NaiveDateTime, sample_rate: u32, dir: &Path, track: &str) -> Bext {
+    let take_name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Bext::at(origin, sample_rate, format!("{take_name} {track}"))
+}
+
+fn check_free_space(path: &Path, min_free: u64) -> Result<(), String> {
+    match fs2::available_space(path) {
+        Ok(free) if free < min_free => Err(format!(
+            "ディスクの空きが {} MB を下回ったため録音できません",
+            min_free / (1024 * 1024)
+        )),
+        Ok(_) => Ok(()),
+        // Some network drives cannot report free space; recording can still work there.
+        Err(e) => {
+            log::warn!("could not read free space of {}: {e}", path.display());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const CH: usize = 4;
+    const RATE: u32 = 1000;
+
+    struct Rig {
+        producer: rtrb::Producer<f32>,
+        recorder: Recorder,
+        dropped: Arc<AtomicU64>,
+        root: tempfile::TempDir,
+    }
+
+    fn rig() -> Rig {
+        let (producer, consumer) = rtrb::RingBuffer::new(CH * 10_000);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut config = RecorderConfig::new(CH, RATE);
+        config.header_interval = Duration::from_millis(10);
+        config.min_free_bytes = 0;
+        let recorder = Recorder::spawn(consumer, config, dropped.clone()).unwrap();
+        Rig {
+            producer,
+            recorder,
+            dropped,
+            root: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// Frame `n`, channel `c` carries a value identifying both.
+    fn sample(n: usize, c: usize) -> f32 {
+        ((n % 1000) as f32 * 4.0 + c as f32) / 8192.0
+    }
+
+    fn feed(p: &mut rtrb::Producer<f32>, from: usize, frames: usize) {
+        for n in from..from + frames {
+            for c in 0..CH {
+                p.push(sample(n, c)).unwrap();
+            }
+        }
+    }
+
+    fn request(root: &Path, tracks: Vec<TrackRequest>) -> TakeRequest {
+        TakeRequest {
+            root: root.to_owned(),
+            label: String::new(),
+            tracks,
+            format: SampleFormat::Float32,
+            host: "Test".into(),
+            device: "Fake".into(),
+        }
+    }
+
+    fn wait_event(r: &Recorder) -> RecorderEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(e) = r.try_event() {
+                return e;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("no recorder event");
+    }
+
+    fn wait_until(cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Decodes float samples from the data chunk (the last chunk in our layout).
+    fn read_float_wav(path: &Path) -> Vec<f32> {
+        let bytes = fs::read(path).unwrap();
+        let at = bytes.windows(4).rposition(|w| w == b"data").unwrap();
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        bytes[at + 8..at + 8 + size]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    }
+
+    fn stopped(r: &Recorder) -> TakeSummary {
+        loop {
+            match wait_event(r) {
+                RecorderEvent::Stopped(s) => return s,
+                RecorderEvent::Error(e) => panic!("unexpected error: {e}"),
+                RecorderEvent::Started { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn writes_each_track_from_its_source_channels() {
+        let mut rig = rig();
+        let tracks = vec![
+            TrackRequest {
+                name: "Vocal".into(),
+                channels: vec![0],
+            },
+            TrackRequest {
+                name: "Guitar".into(),
+                channels: vec![1],
+            },
+            TrackRequest {
+                name: "Synth".into(),
+                channels: vec![2, 3],
+            },
+        ];
+        rig.recorder.start(request(rig.root.path(), tracks));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        assert!(dir.join(take::MARKER_FILE).exists());
+        feed(&mut rig.producer, 0, 500);
+        wait_until(|| rig.recorder.frames_recorded() == 500);
+        rig.recorder.stop();
+        let summary = stopped(&rig.recorder);
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(summary.frames, 500);
+        assert!(!rig.recorder.is_recording());
+        assert!(!dir.join(take::MARKER_FILE).exists());
+
+        let vocal = read_float_wav(&dir.join("01_Vocal.wav"));
+        let guitar = read_float_wav(&dir.join("02_Guitar.wav"));
+        let synth = read_float_wav(&dir.join("03_Synth.wav"));
+        assert_eq!(vocal, (0..500).map(|n| sample(n, 0)).collect::<Vec<_>>());
+        assert_eq!(guitar, (0..500).map(|n| sample(n, 1)).collect::<Vec<_>>());
+        let expected_synth: Vec<f32> = (0..500)
+            .flat_map(|n| [sample(n, 2), sample(n, 3)])
+            .collect();
+        assert_eq!(synth, expected_synth);
+
+        let meta = take::read_meta(&dir).unwrap();
+        assert_eq!(meta.frames, 500);
+        assert_eq!(meta.tracks[2].inputs, vec![3, 4]);
+    }
+
+    #[test]
+    fn preroll_includes_audio_from_before_start() {
+        let mut rig = rig();
+        rig.recorder.set_preroll(1); // 1 s = 1000 frames at RATE
+        feed(&mut rig.producer, 0, 1500);
+        wait_until(|| rig.producer.slots() == CH * 10_000);
+        rig.recorder.start(request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        ));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 1500, 100);
+        wait_until(|| rig.recorder.frames_recorded() == 1100);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+        let a = read_float_wav(&dir.join("01_A.wav"));
+        assert_eq!(a, (500..1600).map(|n| sample(n, 0)).collect::<Vec<_>>());
+        assert_eq!(take::read_meta(&dir).unwrap().preroll_frames, 1000);
+    }
+
+    #[test]
+    fn header_is_updated_while_recording() {
+        let mut rig = rig();
+        rig.recorder.start(request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        ));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 200);
+        let path = dir.join("01_A.wav");
+        wait_until(|| {
+            fs::read(&path)
+                .map(|_| read_float_wav(&path).len() == 200)
+                .unwrap_or(false)
+        });
+        assert!(rig.recorder.is_recording());
+    }
+
+    #[test]
+    fn dropped_frames_during_take_are_counted() {
+        let mut rig = rig();
+        rig.dropped.store(7, Ordering::Relaxed);
+        rig.recorder.start(request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        ));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        rig.dropped.fetch_add(3, Ordering::Relaxed);
+        feed(&mut rig.producer, 0, 10);
+        rig.recorder.stop();
+        let summary = stopped(&rig.recorder);
+        assert_eq!(summary.dropped_frames, 3);
+        assert_eq!(take::read_meta(&dir).unwrap().dropped_frames, 3);
+    }
+
+    #[test]
+    fn rejects_channels_the_device_lacks() {
+        let rig = rig();
+        rig.recorder.start(request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![CH],
+            }],
+        ));
+        assert!(matches!(wait_event(&rig.recorder), RecorderEvent::Error(_)));
+        assert!(!rig.recorder.is_recording());
+    }
+
+    #[test]
+    fn shutdown_finalizes_an_active_take() {
+        let mut rig = rig();
+        rig.recorder.start(request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        ));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 50);
+        let events = rig.recorder.shutdown();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RecorderEvent::Stopped(_)))
+        );
+        assert_eq!(read_float_wav(&dir.join("01_A.wav")).len(), 50);
+        assert!(!dir.join(take::MARKER_FILE).exists());
+    }
+
+    #[test]
+    fn preroll_keeps_only_the_newest_samples() {
+        let mut p = PreRoll::new(4);
+        p.push(&[1.0, 2.0, 3.0]);
+        p.push(&[4.0, 5.0]);
+        assert_eq!(p.take(), vec![2.0, 3.0, 4.0, 5.0]);
+        p.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(p.take(), vec![3.0, 4.0, 5.0, 6.0]);
+        let mut off = PreRoll::new(0);
+        off.push(&[1.0]);
+        assert!(off.take().is_empty());
+    }
+}
