@@ -27,6 +27,10 @@ pub struct AppConfig {
     pub output_dir: Option<PathBuf>,
     /// Track layouts keyed by [`device_key`], so each interface keeps its own.
     pub tracks: BTreeMap<String, Vec<Track>>,
+    /// `true` turns off the update check at launch.
+    pub skip_update_check: bool,
+    /// A release the user chose not to be told about again.
+    pub skipped_version: Option<String>,
 }
 
 pub fn device_key(host: &str, device: &str) -> String {
@@ -43,6 +47,11 @@ pub fn config_path() -> Option<PathBuf> {
 
 pub fn log_dir() -> Option<PathBuf> {
     project_dirs().map(|d| d.data_local_dir().join("logs"))
+}
+
+/// Where a downloaded installer is kept until it runs.
+pub fn update_dir() -> Option<PathBuf> {
+    project_dirs().map(|d| d.data_local_dir().join("updates"))
 }
 
 /// `<Music>/recrec`, falling back to the home directory and then the working directory.
@@ -126,6 +135,8 @@ mod tests {
             preroll_secs: 5,
             output_dir: Some(dir.path().join("out")),
             tracks: BTreeMap::new(),
+            skip_update_check: true,
+            skipped_version: Some("0.2.0".into()),
         };
         cfg.tracks.insert(
             device_key("ASIO", "Audio Interface"),
@@ -174,5 +185,7 @@ mod tests {
         assert_eq!(warning, None);
         assert_eq!(cfg.preroll_secs, 3);
         assert_eq!(cfg.format, SampleFormat::Pcm24);
+        assert!(!cfg.skip_update_check);
+        assert_eq!(cfg.skipped_version, None);
     }
 }

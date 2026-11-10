@@ -23,10 +23,13 @@ fs2 = "0.4"
 log = "0.4"
 rfd = "0.18"
 rtrb = "0.4"
+semver = "1.0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.1"
 simplelog = "0.12"
 thiserror = "2"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 drag = "2"

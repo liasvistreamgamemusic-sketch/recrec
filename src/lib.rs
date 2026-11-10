@@ -7,4 +7,5 @@ pub mod recorder;
 pub mod take;
 pub mod track;
 pub mod ui;
+pub mod update;
 pub mod wav;
