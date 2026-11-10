@@ -87,7 +87,7 @@ pub fn meter_scale(ui: &mut Ui, left: f32, right: f32) {
     let height = 14.0;
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let span = Rect::from_min_max(Pos2::new(left, row.top()), Pos2::new(right, row.bottom()));
-    for db in [-60.0f32, -48.0, -36.0, -24.0, -18.0, -12.0, -6.0, 0.0] {
+    for db in [-60.0f32, -48.0, -36.0, -24.0, -12.0, 0.0] {
         let align = if db == 0.0 {
             Align2::RIGHT_CENTER
         } else if db == METER_FLOOR_DB {

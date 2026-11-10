@@ -153,7 +153,8 @@ fn fonts() -> FontDefinitions {
         .cloned()
         .unwrap_or_default();
     let family = |primary: &str| {
-        let mut list = vec![primary.to_owned(), ICONS.to_owned()];
+        // Icons first: Inter maps some of the same private-use codepoints to its own glyphs.
+        let mut list = vec![ICONS.to_owned(), primary.to_owned()];
         list.extend(builtin.iter().cloned());
         list
     };

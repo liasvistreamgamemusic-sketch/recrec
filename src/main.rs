@@ -74,8 +74,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("recrec {}", env!("CARGO_PKG_VERSION")))
-            .with_inner_size([1320.0, 820.0])
-            .with_min_inner_size([1080.0, 640.0])
+            .with_inner_size([1360.0, 840.0])
+            .with_min_inner_size([1280.0, 680.0])
             .with_icon(app_icon()),
         ..Default::default()
     };

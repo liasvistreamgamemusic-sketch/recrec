@@ -24,9 +24,9 @@ use crate::track::Source;
 use crate::wav::SampleFormat;
 
 const SIDEBAR_WIDTH: f32 = 288.0;
-const TAKES_WIDTH: f32 = 372.0;
-const TRACK_NAME_WIDTH: f32 = 150.0;
-const TRACK_SOURCE_WIDTH: f32 = 168.0;
+const TAKES_WIDTH: f32 = 340.0;
+const TRACK_NAME_WIDTH: f32 = 116.0;
+const TRACK_SOURCE_WIDTH: f32 = 140.0;
 const TRACK_METER_HEIGHT: f32 = 12.0;
 const DB_READOUT_WIDTH: f32 = 46.0;
 const MAX_TOASTS: usize = 3;
