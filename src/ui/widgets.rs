@@ -16,6 +16,11 @@ pub const RECORD_BUTTON_SIZE: f32 = 88.0;
 const ICON_BUTTON_SIZE: f32 = 28.0;
 const SEGMENTED_HEIGHT: f32 = 30.0;
 
+/// Keyboard-focus ring: the one place the accent color always appears.
+fn focus_stroke() -> Stroke {
+    Stroke::new(2.0, theme::ACCENT)
+}
+
 fn x_for_db(rect: Rect, db: f32) -> f32 {
     let t = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
     rect.left() + t * rect.width()
@@ -230,6 +235,9 @@ pub fn record_button(ui: &mut Ui, recording: bool, enabled: bool) -> Response {
         fill,
     );
 
+    if response.has_focus() {
+        painter.circle_stroke(center, outer + 4.0, focus_stroke());
+    }
     let response = response.on_hover_text(if recording {
         "停止 (Space)"
     } else {
@@ -286,6 +294,9 @@ pub fn arm_toggle(ui: &mut Ui, armed: bool, enabled: bool) -> Response {
         theme::lerp(3.0, 5.0, on),
         theme::mix(theme::INK_TERTIARY, theme::REC, on),
     );
+    if response.has_focus() {
+        painter.circle_stroke(center, 14.0, focus_stroke());
+    }
     let response = response.on_hover_text(if armed {
         "録音します (クリックで外す)"
     } else {
@@ -331,6 +342,14 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str, danger: bool) -> Res
         theme::icons(theme::ICON_SIZE),
         theme::mix(base, target, hover),
     );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(theme::RADIUS_SM),
+            focus_stroke(),
+            StrokeKind::Inside,
+        );
+    }
     response
         .on_hover_text(tooltip)
         .on_hover_cursor(CursorIcon::PointingHand)
