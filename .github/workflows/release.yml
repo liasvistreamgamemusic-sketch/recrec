@@ -54,9 +54,10 @@ jobs:
       - name: Checksums
         shell: pwsh
         run: |
-          Get-ChildItem dist -File | ForEach-Object {
+          $lines = Get-ChildItem dist -File | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          } | Out-File dist/SHA256SUMS.txt -Encoding ascii
+          }
+          $lines | Out-File dist/SHA256SUMS.txt -Encoding ascii
           Get-Content dist/SHA256SUMS.txt
       - name: Publish GitHub release
         shell: pwsh
