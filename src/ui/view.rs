@@ -10,7 +10,7 @@ use eframe::egui::{
     Order, RichText, ScrollArea, Sense, Slider, Stroke, TextEdit, Ui, Vec2,
 };
 
-use super::app::{Level, Message, RecrecApp, format_bytes, format_duration};
+use super::app::{Level, Message, RecrecApp, UpdateState, format_bytes, format_duration};
 use super::theme::{self, icon};
 use super::widgets::{
     RECORD_BUTTON_SIZE, arm_toggle, badge, clip_badge, db_readout, field_label, file_chip,
@@ -46,6 +46,15 @@ impl RecrecApp {
         }
 
         let panel = |margin: Margin| Frame::new().fill(theme::CANVAS).inner_margin(margin);
+        if self.update_banner_visible() {
+            egui::Panel::top("update_banner")
+                .frame(
+                    Frame::new()
+                        .fill(theme::SURFACE_2)
+                        .inner_margin(Margin::symmetric(20, 8)),
+                )
+                .show(ui, |ui| self.update_banner(ui));
+        }
         egui::Panel::bottom("status_bar")
             .frame(panel(Margin::symmetric(20, 6)))
             .show(ui, |ui| self.status_bar(ui));
@@ -67,6 +76,99 @@ impl RecrecApp {
                 self.track_list(ui);
             });
         self.toasts(&ctx);
+    }
+
+    // ---- update banner -------------------------------------------------------------------
+
+    /// Stays out of the way while recording, except to say that a finished download waits.
+    fn update_banner_visible(&self) -> bool {
+        match self.update {
+            UpdateState::Idle => false,
+            UpdateState::Available(_) | UpdateState::Downloading { .. } => !self.is_busy(),
+            UpdateState::Ready { .. } => true,
+        }
+    }
+
+    fn update_banner(&mut self, ui: &mut Ui) {
+        let busy = self.is_busy();
+        let text = match &self.update {
+            UpdateState::Idle => return,
+            UpdateState::Available(release) => format!(
+                "recrec {} が利用できます (現在 {})",
+                release.version,
+                env!("CARGO_PKG_VERSION")
+            ),
+            UpdateState::Downloading {
+                release,
+                received,
+                total,
+            } => {
+                let progress = match total {
+                    Some(total) => {
+                        format!("{} / {}", format_bytes(*received), format_bytes(*total))
+                    }
+                    None => format_bytes(*received),
+                };
+                format!(
+                    "recrec {} をダウンロードしています… {progress}",
+                    release.version
+                )
+            }
+            UpdateState::Ready { release, .. } if busy => format!(
+                "recrec {} の準備ができました。録音を止めると更新できます",
+                release.version
+            ),
+            UpdateState::Ready { release, .. } => {
+                format!("recrec {} の準備ができました", release.version)
+            }
+        };
+        let available = matches!(self.update, UpdateState::Available(_));
+        let ready = matches!(self.update, UpdateState::Ready { .. });
+        let self_update = self.can_self_update();
+        ui.horizontal(|ui| {
+            ui.label(theme::with_icon(
+                icon::BELL,
+                &text,
+                theme::medium(theme::TEXT_BODY),
+                theme::INK,
+            ));
+            // Right-to-left: the first button added sits at the far right.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if available {
+                    if banner_button(ui, "閉じる", false)
+                        .on_hover_text("次に起動したときにまたお知らせします")
+                        .clicked()
+                    {
+                        self.dismiss_update();
+                    }
+                    if banner_button(ui, "このバージョンをスキップ", false).clicked() {
+                        self.skip_update();
+                    }
+                }
+                if banner_button(ui, "変更内容", false)
+                    .on_hover_text("リリースページをブラウザーで開きます")
+                    .clicked()
+                {
+                    self.open_release_page();
+                }
+                if available {
+                    let (label, hint) = if self_update {
+                        ("更新", "ダウンロードして recrec を更新し、開き直します")
+                    } else {
+                        (
+                            "ダウンロードページを開く",
+                            "新しいバージョンをブラウザーからダウンロードします",
+                        )
+                    };
+                    if banner_button(ui, label, true).on_hover_text(hint).clicked() {
+                        self.start_update();
+                    }
+                }
+                if ready && !busy && banner_button(ui, "更新", true).clicked() {
+                    self.install_update();
+                }
+            });
+        });
     }
 
     // ---- sidebar -------------------------------------------------------------------------
@@ -101,6 +203,18 @@ impl RecrecApp {
         section_label(ui, "録音");
         ui.add_space(theme::SPACE_XXS);
         ui.add_enabled_ui(!busy, |ui| self.recording_fields(ui));
+
+        ui.add_space(theme::SPACE_LG);
+        section_label(ui, "アップデート");
+        ui.add_space(theme::SPACE_XXS);
+        let mut check_updates = !self.config.skip_update_check;
+        if ui
+            .checkbox(&mut check_updates, "起動時に確認する")
+            .on_hover_text("起動するたびに GitHub へ最新バージョンを問い合わせます")
+            .changed()
+        {
+            self.set_update_check(check_updates);
+        }
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| self.disk_usage(ui));
     }
@@ -927,6 +1041,16 @@ fn take_card(
     });
     let hovered = card.response.contains_pointer();
     ui.data_mut(|d| d.insert_temp(id, hovered));
+}
+
+/// Text button of the update banner; `primary` marks the one recommended action.
+fn banner_button(ui: &mut Ui, text: &str, primary: bool) -> egui::Response {
+    let label = RichText::new(text).font(theme::medium(theme::TEXT_BODY));
+    if primary {
+        ui.add(Button::new(label.color(theme::INK)).fill(theme::ACCENT))
+    } else {
+        ui.add(Button::new(label.color(theme::INK_SUBTLE)).frame(false))
+    }
 }
 
 fn empty_state(ui: &mut Ui, glyph: &str, title: &str, hint: &str) {

@@ -1,10 +1,12 @@
 //! Application state and the actions the view triggers.
 
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use cpal::HostId;
+use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui;
 
 use crate::audio::devices::{self, DeviceInfo};
@@ -15,6 +17,7 @@ use crate::platform::SleepGuard;
 use crate::recorder::{RecorderEvent, TakeRequest, TrackRequest};
 use crate::take::{self, TakeEntry};
 use crate::track::{self, Track};
+use crate::update::{self, Release, UpdateError};
 
 const CONFIG_SAVE_DELAY: Duration = Duration::from_secs(1);
 const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(2);
@@ -36,6 +39,30 @@ pub(super) struct Message {
     pub at: DateTime<Local>,
     /// Monotonic creation time, used to time toast animations.
     pub born: Instant,
+}
+
+/// Where the update flow stands. Drawn as the banner at the top of the window.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum UpdateState {
+    /// Nothing to show: not checked yet, up to date, or closed by the user.
+    Idle,
+    Available(Release),
+    Downloading {
+        release: Release,
+        received: u64,
+        total: Option<u64>,
+    },
+    /// Downloaded and verified; waiting for the recording to stop or for a retry.
+    Ready {
+        release: Release,
+        installer: PathBuf,
+    },
+}
+
+enum UpdateEvent {
+    Checked(Result<Release, UpdateError>),
+    Progress(u64, Option<u64>),
+    Downloaded(Result<PathBuf, UpdateError>),
 }
 
 pub struct RecrecApp {
@@ -64,6 +91,13 @@ pub struct RecrecApp {
     pub(super) meter_span: Option<(f32, f32)>,
     last_space_check: Option<Instant>,
     pub(super) pending_drag: Option<Vec<PathBuf>>,
+    pub(super) update: UpdateState,
+    /// Events of the running update thread, if any.
+    update_rx: Option<Receiver<UpdateEvent>>,
+    /// Whether this copy can run a downloaded installer (installed build with a download dir).
+    self_update_supported: bool,
+    /// Set once the installer took over; the window closes on the next frame.
+    quit_requested: bool,
 }
 
 impl RecrecApp {
@@ -103,6 +137,11 @@ impl RecrecApp {
             meter_span: None,
             last_space_check: None,
             pending_drag: None,
+            update: UpdateState::Idle,
+            update_rx: None,
+            self_update_supported: crate::platform::is_installed_build()
+                && config::update_dir().is_some(),
+            quit_requested: false,
         };
         if let Some(w) = warning {
             app.push(Level::Warn, w);
@@ -111,6 +150,7 @@ impl RecrecApp {
         app.refresh_takes();
         app.reload_devices();
         app.open_session();
+        app.start_update_check();
         app
     }
 
@@ -504,12 +544,210 @@ impl RecrecApp {
             self.total_space = fs2::total_space(&probe).ok();
         }
 
+        self.poll_update();
+
         if self
             .config_dirty_since
             .is_some_and(|t| t.elapsed() >= CONFIG_SAVE_DELAY)
         {
             self.save_config();
         }
+    }
+
+    /// Removes leftovers of earlier updates and asks GitHub for the latest release.
+    fn start_update_check(&mut self) {
+        if let Some(dir) = config::update_dir()
+            && let Err(e) = update::clean_update_dir(&dir)
+        {
+            log::warn!("could not clean {}: {e}", dir.display());
+        }
+        if self.config.skip_update_check {
+            return;
+        }
+        self.spawn_update_thread("recrec-update-check", |send| {
+            send(UpdateEvent::Checked(update::fetch_latest()));
+        });
+    }
+
+    /// Runs `work` on its own thread; what it passes to `send` arrives in [`Self::poll_update`].
+    fn spawn_update_thread(
+        &mut self,
+        name: &str,
+        work: impl FnOnce(&mut dyn FnMut(UpdateEvent)) + Send + 'static,
+    ) -> bool {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let spawned = thread::Builder::new().name(name.into()).spawn(move || {
+            work(&mut |event| {
+                if tx.send(event).is_err() {
+                    log::debug!("update event dropped: the app is closing");
+                }
+            });
+        });
+        match spawned {
+            Ok(_) => {
+                self.update_rx = Some(rx);
+                true
+            }
+            Err(e) => {
+                log::warn!("could not start {name}: {e}");
+                false
+            }
+        }
+    }
+
+    fn poll_update(&mut self) {
+        let Some(rx) = &self.update_rx else {
+            return;
+        };
+        let mut events = Vec::new();
+        let finished = loop {
+            match rx.try_recv() {
+                Ok(e) => events.push(e),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+        for e in events {
+            self.handle_update_event(e);
+        }
+        if finished {
+            self.update_rx = None;
+            // A download thread that ended without a result died; let the user retry.
+            if let UpdateState::Downloading { release, .. } = &self.update {
+                self.update = UpdateState::Available(release.clone());
+                self.push(Level::Error, "アップデートのダウンロードが中断されました");
+            }
+        }
+    }
+
+    fn handle_update_event(&mut self, event: UpdateEvent) {
+        match event {
+            UpdateEvent::Checked(Ok(release)) => {
+                let skipped = self.config.skipped_version.as_deref();
+                if update::is_newer(&release, &update::current_version(), skipped) {
+                    log::info!("update available: {}", release.version);
+                    self.update = UpdateState::Available(release);
+                } else {
+                    log::info!("no update to announce (latest is {})", release.version);
+                }
+            }
+            // Being offline is normal in a studio: the log is enough.
+            UpdateEvent::Checked(Err(e)) => log::warn!("update check failed: {e}"),
+            UpdateEvent::Progress(now_received, now_total) => {
+                if let UpdateState::Downloading {
+                    received, total, ..
+                } = &mut self.update
+                {
+                    *received = now_received;
+                    *total = now_total;
+                }
+            }
+            UpdateEvent::Downloaded(result) => {
+                let UpdateState::Downloading { release, .. } = &self.update else {
+                    return;
+                };
+                let release = release.clone();
+                match result {
+                    Ok(installer) => {
+                        self.update = UpdateState::Ready { release, installer };
+                        self.install_update();
+                    }
+                    Err(e) => {
+                        self.update = UpdateState::Available(release);
+                        self.push(
+                            Level::Error,
+                            format!("アップデートをダウンロードできません: {e}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether "update" installs in place; otherwise it only opens the release page.
+    pub(super) fn can_self_update(&self) -> bool {
+        self.self_update_supported
+            && matches!(&self.update, UpdateState::Available(release) if release.installer.is_some())
+    }
+
+    /// Downloads the installer in the background, or opens the release page when this copy
+    /// cannot update itself.
+    pub(super) fn start_update(&mut self) {
+        let UpdateState::Available(release) = &self.update else {
+            return;
+        };
+        let Some(dir) = config::update_dir().filter(|_| self.can_self_update()) else {
+            self.open_release_page();
+            return;
+        };
+        let release = release.clone();
+        let job = release.clone();
+        let started = self.spawn_update_thread("recrec-update-download", move |send| {
+            let result = update::download_installer(&job, &dir, |received, total| {
+                send(UpdateEvent::Progress(received, total));
+            });
+            send(UpdateEvent::Downloaded(result));
+        });
+        if started {
+            self.update = UpdateState::Downloading {
+                release,
+                received: 0,
+                total: None,
+            };
+        } else {
+            self.push(Level::Error, "アップデートを開始できません");
+        }
+    }
+
+    /// Hands over to the downloaded installer and closes the app. Never while recording:
+    /// the installer shuts recrec down.
+    pub(super) fn install_update(&mut self) {
+        let UpdateState::Ready { installer, .. } = &self.update else {
+            return;
+        };
+        if self.is_busy() {
+            return;
+        }
+        match crate::platform::launch_installer(installer) {
+            Ok(()) => {
+                log::info!("installer started; closing");
+                self.quit_requested = true;
+            }
+            Err(e) => self.push(Level::Error, format!("インストーラーを起動できません: {e}")),
+        }
+    }
+
+    pub(super) fn open_release_page(&mut self) {
+        let (UpdateState::Available(release)
+        | UpdateState::Downloading { release, .. }
+        | UpdateState::Ready { release, .. }) = &self.update
+        else {
+            return;
+        };
+        if let Err(e) = crate::platform::open_url(&release.page_url) {
+            self.push(Level::Error, format!("ブラウザを開けません: {e}"));
+        }
+    }
+
+    /// Stops announcing this release; a later one is announced again.
+    pub(super) fn skip_update(&mut self) {
+        if let UpdateState::Available(release) = &self.update {
+            self.config.skipped_version = Some(release.version.to_string());
+            self.mark_dirty();
+            self.update = UpdateState::Idle;
+        }
+    }
+
+    /// Hides the banner until the next launch.
+    pub(super) fn dismiss_update(&mut self) {
+        if matches!(self.update, UpdateState::Available(_)) {
+            self.update = UpdateState::Idle;
+        }
+    }
+
+    pub(super) fn set_update_check(&mut self, enabled: bool) {
+        self.config.skip_update_check = !enabled;
+        self.mark_dirty();
     }
 
     pub(super) fn mark_dirty(&mut self) {
@@ -569,6 +807,9 @@ impl eframe::App for RecrecApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.draw(ui);
         self.run_pending_drag(frame);
+        if self.quit_requested {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
     }
 
