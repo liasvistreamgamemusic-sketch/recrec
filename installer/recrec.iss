@@ -49,4 +49,6 @@ Name: "{group}\{cm:UninstallProgram,recrec}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\recrec"; Filename: "{app}\recrec.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\recrec.exe"; Description: "{cm:LaunchProgram,recrec}"; Flags: nowait postinstall skipifsilent
+; No skipifsilent: the in-app updater runs this installer with /SILENT and expects recrec
+; to come back afterwards.
+Filename: "{app}\recrec.exe"; Description: "{cm:LaunchProgram,recrec}"; Flags: nowait postinstall

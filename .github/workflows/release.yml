@@ -61,6 +61,8 @@ jobs:
           }
           $lines | Out-File dist/SHA256SUMS.txt -Encoding ascii
           Get-Content dist/SHA256SUMS.txt
+      # The asset names are a contract with the in-app updater (src/update.rs):
+      # recrec-<version>-setup.exe and SHA256SUMS.txt. Change both sides together.
       - name: Publish GitHub release
         shell: pwsh
         env:
