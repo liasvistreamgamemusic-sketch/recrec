@@ -77,3 +77,23 @@ pub fn start_file_drag(frame: &eframe::Frame, files: Vec<PathBuf>) -> Result<(),
 pub fn start_file_drag(_frame: &eframe::Frame, _files: Vec<PathBuf>) -> Result<(), String> {
     Err("ファイルのドラッグは Windows 版のみ対応しています".into())
 }
+
+/// Whether the OS asks apps to minimize animation (Windows: "Animation effects" off).
+pub fn prefers_reduced_motion() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+        };
+        let mut enabled: i32 = 1;
+        // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL through the pointer we pass.
+        let ok = unsafe {
+            SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0)
+        };
+        ok != 0 && enabled == 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
