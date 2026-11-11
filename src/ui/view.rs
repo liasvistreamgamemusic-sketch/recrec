@@ -38,8 +38,9 @@ const DB_READOUT_WIDTH: f32 = 46.0;
 /// The waveform lanes show the last 10 seconds.
 const WAVE_WINDOW_BLOCKS: usize = 10 * waveform::BLOCKS_PER_SECOND as usize;
 const EDIT_DIALOG_WIDTH: f32 = 380.0;
-/// Width of the clock and summary beside the record button (fits "1:23:45.6").
-const CLOCK_COLUMN_WIDTH: f32 = 340.0;
+/// Width of the clock and summary beside the record button.
+const CLOCK_COLUMN_WIDTH: f32 = 300.0;
+const TAKE_NAME_WIDTH: f32 = 240.0;
 const SCROLL_BAR_GUTTER: f32 = 10.0;
 const MAX_TOASTS: usize = 3;
 const TOAST_WIDTH: f32 = 380.0;
@@ -647,8 +648,10 @@ impl RecrecApp {
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Shrinks on narrow windows instead of pushing the card wider.
+                        let width = ui.available_width().min(TAKE_NAME_WIDTH);
                         ui.vertical(|ui| {
-                            ui.set_width(240.0);
+                            ui.set_width(width);
                             field_label(ui, "テイク名 (任意)");
                             ui.add_enabled(
                                 !busy,
