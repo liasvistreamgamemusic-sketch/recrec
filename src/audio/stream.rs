@@ -103,7 +103,7 @@ impl InputSession {
         // Build the output before starting anything: ASIO sets up both directions together.
         let mixer = OutputMixer::new(monitor_rx, transport.clone(), sample_rate);
         let (output, output_error) =
-            match output::open(host_id, device_name, sample_rate, buffer_size, mixer) {
+            match output::open(host_id, &device, sample_rate, buffer_size, mixer) {
                 Ok(out) => (Some(out), None),
                 Err(e) => {
                     log::warn!("output unavailable: {e:#}");

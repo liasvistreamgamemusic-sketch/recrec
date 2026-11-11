@@ -127,26 +127,33 @@ impl OutputMixer {
     }
 }
 
-/// Builds the output stream for `mixer` on `device_name` (falling back to the host default).
-/// The caller starts it with `play`.
+/// Builds the output stream for `mixer`. The caller starts it with `play`.
+///
+/// `input_device` is used when it can also play (an ASIO driver serves both directions, and
+/// only one driver can be loaded at a time, so it must not be looked up again). Otherwise the
+/// host's default output device is used.
 pub fn open(
     host_id: HostId,
-    device_name: &str,
+    input_device: &cpal::Device,
     sample_rate: u32,
     buffer_size: Option<u32>,
     mixer: OutputMixer,
 ) -> anyhow::Result<cpal::Stream> {
-    let host = cpal::host_from_id(host_id)
-        .with_context(|| format!("{} を初期化できません", host_id.name()))?;
-    let device = host
-        .output_devices()
-        .ok()
-        .and_then(|mut devices| devices.find(|d| d.to_string() == device_name))
-        .or_else(|| host.default_output_device())
-        .ok_or_else(|| anyhow!("出力デバイスが見つかりません"))?;
-    let supported = device
-        .default_output_config()
-        .context("出力デバイスの設定を取得できません")?;
+    let fallback;
+    let (device, supported) = match input_device.default_output_config() {
+        Ok(config) => (input_device, config),
+        Err(_) => {
+            let host = cpal::host_from_id(host_id)
+                .with_context(|| format!("{} を初期化できません", host_id.name()))?;
+            fallback = host
+                .default_output_device()
+                .ok_or_else(|| anyhow!("出力デバイスが見つかりません"))?;
+            let config = fallback
+                .default_output_config()
+                .context("出力デバイスの設定を取得できません")?;
+            (&fallback, config)
+        }
+    };
     let channels = supported.channels();
     let config = StreamConfig {
         channels,
@@ -154,10 +161,10 @@ pub fn open(
         buffer_size: buffer_size.map_or(BufferSize::Default, BufferSize::Fixed),
     };
     let stream = match supported.sample_format() {
-        SampleFormat::I16 => build::<i16>(&device, config, mixer),
-        SampleFormat::I24 => build::<cpal::I24>(&device, config, mixer),
-        SampleFormat::I32 => build::<i32>(&device, config, mixer),
-        SampleFormat::F32 => build::<f32>(&device, config, mixer),
+        SampleFormat::I16 => build::<i16>(device, config, mixer),
+        SampleFormat::I24 => build::<cpal::I24>(device, config, mixer),
+        SampleFormat::I32 => build::<i32>(device, config, mixer),
+        SampleFormat::F32 => build::<f32>(device, config, mixer),
         other => bail!("出力のサンプル形式 {other} には対応していません"),
     }
     .with_context(|| format!("出力を {sample_rate} Hz / {channels} ch で開けません"))?;
