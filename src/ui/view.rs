@@ -1368,7 +1368,8 @@ impl RecrecApp {
         let mut drag: Option<Vec<PathBuf>> = None;
         let mut open: Option<PathBuf> = None;
         let mut edit: Option<PathBuf> = None;
-        let mut listen: Option<PathBuf> = None;
+        // Take to open, and whether to start playing it right away.
+        let mut listen: Option<(PathBuf, bool)> = None;
         let mut refresh = false;
 
         ui.horizontal(|ui| {
@@ -1436,8 +1437,11 @@ impl RecrecApp {
                 }
             });
 
-        if let Some(dir) = listen {
+        if let Some((dir, play)) = listen {
             self.open_take(&dir);
+            if play {
+                self.play_from_start();
+            }
         }
 
         if let Some(dir) = edit
@@ -1698,7 +1702,7 @@ fn take_card(
     drag: &mut Option<Vec<PathBuf>>,
     open: &mut Option<PathBuf>,
     edit: &mut Option<PathBuf>,
-    listen: &mut Option<PathBuf>,
+    listen: &mut Option<(PathBuf, bool)>,
 ) {
     let id = Id::unique(("take", &take.dir));
     let can_drag = platform::file_drag_supported() && !take.in_progress;
@@ -1747,23 +1751,32 @@ fn take_card(
                         }
                         handle.on_hover_cursor(egui::CursorIcon::Grab);
                     }
-                    ui.add(
+                    let name = ui.add(
                         Label::new(
                             RichText::new(&take.name)
                                 .font(theme::medium(theme::TEXT_BODY))
                                 .color(theme::INK),
                         )
-                        .truncate(),
+                        .truncate()
+                        .selectable(false)
+                        .sense(Sense::click()),
                     );
+                    if !take.in_progress {
+                        if name.clicked() {
+                            *listen = Some((take.dir.clone(), false));
+                        }
+                        name.on_hover_text("クリックで開く (波形を表示)")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon_button(ui, icon::FOLDER_OPEN, "フォルダを開く", false).clicked()
                         {
                             *open = Some(take.dir.clone());
                         }
                         if !take.in_progress
-                            && icon_button(ui, icon::PLAY, "開いて聴き直す", false).clicked()
+                            && icon_button(ui, icon::PLAY, "開いて再生", false).clicked()
                         {
-                            *listen = Some(take.dir.clone());
+                            *listen = Some((take.dir.clone(), true));
                         }
                         if !take.in_progress
                             && icon_button(
