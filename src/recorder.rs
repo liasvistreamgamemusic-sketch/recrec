@@ -70,6 +70,17 @@ pub struct TakeRequest {
     pub skip_silent: bool,
 }
 
+/// Re-recording from a point: the original take is left untouched and a new take is made
+/// from its first `at_frame` frames plus whatever is recorded next.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PunchRequest {
+    pub source: PathBuf,
+    pub at_frame: u64,
+    /// Folder the new take is created in, and its label.
+    pub root: PathBuf,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TakeSummary {
     pub dir: PathBuf,
@@ -89,6 +100,11 @@ pub enum RecorderEvent {
     Stopped(TakeSummary),
     /// A scheduled start was called off before any file was created.
     Cancelled,
+    /// The new take of a re-recording is prepared; schedule its start with `start_punch`.
+    PunchReady {
+        dir: PathBuf,
+        at_frame: u64,
+    },
     /// User-facing message (Japanese).
     Error(String),
 }
@@ -97,6 +113,10 @@ enum Command {
     Start(TakeRequest),
     /// Continue an existing take: new audio is added to the end of its files.
     Append(PathBuf),
+    /// Build a new take holding the source take up to a frame, ready to record from there.
+    PreparePunch(PunchRequest),
+    /// Start recording into the prepared take at this input-timeline frame.
+    StartPunch(u64),
     Stop,
     Pause,
     Resume,
@@ -139,6 +159,8 @@ impl Recorder {
             preroll: PreRoll::new(0),
             take: None,
             pending: None,
+            prepared: None,
+            punch_at: None,
             frames_seen: 0,
             config,
         };
@@ -164,6 +186,17 @@ impl Recorder {
     /// Continues the take in `dir` from its end.
     pub fn append(&self, dir: PathBuf) {
         self.send(Command::Append(dir));
+    }
+
+    /// Prepares a re-recording from a point of an existing take (see [`PunchRequest`]).
+    /// Answers with [`RecorderEvent::PunchReady`] or an error.
+    pub fn prepare_punch(&self, request: PunchRequest) {
+        self.send(Command::PreparePunch(request));
+    }
+
+    /// Starts the prepared re-recording at input-timeline frame `start_at`.
+    pub fn start_punch(&self, start_at: u64) {
+        self.send(Command::StartPunch(start_at));
     }
 
     /// Stops writing but keeps the files open; [`Self::resume`] continues the same take.
@@ -274,6 +307,8 @@ struct ActiveTake {
     paused: bool,
     /// False when the stored overview could not be continued (it is then rebuilt on open).
     peaks_valid: bool,
+    /// Frames of fade-in still to apply to incoming audio (after a re-recording join).
+    fade_in_left: usize,
     dir: PathBuf,
     tracks: Vec<OpenTrack>,
     meta: TakeMeta,
@@ -297,6 +332,9 @@ struct Worker {
     pending: Option<TakeRequest>,
     /// Frames read from the ring so far: the position on the input timeline.
     frames_seen: u64,
+    /// A re-recording take whose copied part is written, waiting for its start frame.
+    prepared: Option<ActiveTake>,
+    punch_at: Option<u64>,
     config: RecorderConfig,
 }
 
@@ -358,6 +396,31 @@ impl Worker {
                 } else if let Err(msg) = self.append(&dir) {
                     log::error!("could not continue take: {msg}");
                     self.emit(RecorderEvent::Error(msg));
+                }
+            }
+            Command::PreparePunch(request) => {
+                if self.take.is_some() || self.pending.is_some() || self.prepared.is_some() {
+                    log::warn!("re-recording requested while already recording; ignored");
+                } else {
+                    match self.prepare_punch(&request) {
+                        Ok(take) => {
+                            let dir = take.dir.clone();
+                            self.prepared = Some(take);
+                            self.emit(RecorderEvent::PunchReady {
+                                dir,
+                                at_frame: request.at_frame,
+                            });
+                        }
+                        Err(msg) => {
+                            log::error!("could not prepare re-recording: {msg}");
+                            self.emit(RecorderEvent::Error(msg));
+                        }
+                    }
+                }
+            }
+            Command::StartPunch(at) => {
+                if self.prepared.is_some() {
+                    self.punch_at = Some(at);
                 }
             }
             Command::Pause => self.set_paused(true),
@@ -506,6 +569,7 @@ impl Worker {
             skip_silent: false,
             paused: false,
             peaks_valid,
+            fade_in_left: 0,
             dir: dir.to_owned(),
             tracks,
             meta,
@@ -526,9 +590,182 @@ impl Worker {
     }
 
     fn cancel_pending(&mut self) {
-        if self.pending.take().is_some() {
+        let mut cancelled = self.pending.take().is_some();
+        self.punch_at = None;
+        if let Some(take) = self.prepared.take() {
+            // Nothing new was recorded: the prepared copy is of no use. The folder was
+            // created by `prepare_punch` and holds only that copy.
+            let dir = take.dir.clone();
+            drop(take);
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                log::warn!("could not remove unused take {}: {e}", dir.display());
+            }
+            cancelled = true;
+        }
+        if cancelled {
             self.emit(RecorderEvent::Cancelled);
         }
+    }
+
+    /// Creates the take of a re-recording and copies the source up to the join into it.
+    fn prepare_punch(&mut self, request: &PunchRequest) -> Result<ActiveTake, String> {
+        let source =
+            take::read_meta(&request.source).map_err(|e| format!("take.json を読めません: {e}"))?;
+        if source.sample_rate != self.config.sample_rate {
+            return Err(format!(
+                "このテイクは {} Hz で録音されています。今のサンプルレート ({} Hz) では録り直せません",
+                source.sample_rate, self.config.sample_rate
+            ));
+        }
+        if source.tracks.is_empty() {
+            return Err("このテイクにはトラックがありません".into());
+        }
+        let at = request.at_frame.min(source.frames);
+        check_free_space(&request.root, self.config.min_free_bytes)?;
+        let now = Local::now().naive_local();
+        let dir = take::create_take_dir(&request.root, now, &request.label)
+            .map_err(|e| format!("テイクフォルダを作れません: {e}"))?;
+        match self.copy_for_punch(&dir, &request.source, source, at, now) {
+            Ok(take) => Ok(take),
+            Err(msg) => {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    log::warn!("could not remove unfinished take {}: {e}", dir.display());
+                }
+                Err(msg)
+            }
+        }
+    }
+
+    fn copy_for_punch(
+        &self,
+        dir: &Path,
+        source_dir: &Path,
+        source: TakeMeta,
+        at: u64,
+        now: NaiveDateTime,
+    ) -> Result<ActiveTake, String> {
+        const COPY_CHUNK_FRAMES: usize = 1 << 15;
+        take::create_marker(dir).map_err(|e| format!("テイクフォルダに書き込めません: {e}"))?;
+        let block = block_frames(source.sample_rate);
+        let fade = fade_frames(source.sample_rate).min(at as usize);
+        let mut tracks = Vec::with_capacity(source.tracks.len());
+        let mut buf = Vec::new();
+        for (i, t) in source.tracks.iter().enumerate() {
+            let channels: Vec<usize> = t
+                .inputs
+                .iter()
+                .map(|c| usize::from(*c).saturating_sub(1))
+                .collect();
+            if let Some(bad) = channels.iter().find(|c| **c >= self.config.channels) {
+                return Err(format!("入力 {} はこのデバイスにありません", bad + 1));
+            }
+            let from = source_dir.join(&t.file);
+            let mut reader = crate::wav::WavReader::open(&from)
+                .map_err(|e| format!("{} を開けません: {e}", from.display()))?;
+            let path = dir.join(&t.file);
+            let bext = bext_for(now, source.sample_rate, dir, &t.name);
+            let mut writer = WavWriter::create(&path, reader.spec(), &bext, i as u32)
+                .map_err(|e| format!("{} を作れません: {e}", path.display()))?;
+            // The copy must not be dithered a second time.
+            writer.set_dither(false);
+            let mut lanes = vec![LaneBuilder::new(block); channels.len()];
+            let mut copied = 0u64;
+            while copied < at {
+                buf.clear();
+                let want = ((at - copied) as usize).min(COPY_CHUNK_FRAMES);
+                let got = reader
+                    .read(copied, want, &mut buf)
+                    .map_err(|e| format!("{} を読めません: {e}", from.display()))?;
+                if got == 0 {
+                    break;
+                }
+                for (n, frame) in buf.chunks_exact_mut(channels.len()).enumerate() {
+                    // Fade the last few milliseconds out so the join does not click.
+                    let left = at - (copied + n as u64);
+                    if (left as usize) <= fade && fade > 0 {
+                        let gain = (left as f32 - 1.0).max(0.0) / fade as f32;
+                        frame.iter_mut().for_each(|s| *s *= gain);
+                    }
+                    for (lane, s) in lanes.iter_mut().zip(frame.iter()) {
+                        lane.push(*s);
+                    }
+                }
+                writer
+                    .write_samples(&buf)
+                    .map_err(|e| format!("{} への書き込みに失敗しました: {e}", path.display()))?;
+                copied += got as u64;
+            }
+            writer.set_dither(true);
+            tracks.push(OpenTrack {
+                writer,
+                channels,
+                path,
+                buf: Vec::new(),
+                peak: 1.0,
+                lanes,
+            });
+        }
+        let frames = tracks
+            .iter()
+            .map(|t| t.writer.frames_written())
+            .min()
+            .unwrap_or(0);
+        let mut markers: Vec<u64> = source
+            .markers
+            .iter()
+            .copied()
+            .filter(|m| *m < frames)
+            .collect();
+        if frames > 0 {
+            markers.push(frames);
+        }
+        let meta = TakeMeta {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at: now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+            frames,
+            dropped_frames: 0,
+            recovered: false,
+            markers: Vec::new(),
+            skipped_silent: Vec::new(),
+            ..source
+        };
+        take::write_meta(dir, &meta).map_err(|e| format!("take.json を書けません: {e}"))?;
+        let now = Instant::now();
+        Ok(ActiveTake {
+            skip_silent: false,
+            paused: false,
+            peaks_valid: true,
+            fade_in_left: fade_frames(meta.sample_rate),
+            dir: dir.to_owned(),
+            tracks,
+            meta,
+            markers,
+            dropped_at_start: self.dropped_frames.load(Ordering::Relaxed),
+            last_header: now,
+            last_sync: now,
+            last_disk_check: now,
+        })
+    }
+
+    /// Makes a prepared take the one being recorded.
+    fn activate(&mut self, mut take: ActiveTake) {
+        let now = Instant::now();
+        take.last_header = now;
+        take.last_sync = now;
+        take.last_disk_check = now;
+        take.dropped_at_start = self.dropped_frames.load(Ordering::Relaxed);
+        let frames = take.tracks.first().map_or(0, |t| t.writer.frames_written());
+        let dir = take.dir.clone();
+        self.preroll.take();
+        self.take = Some(take);
+        self.shared.frames.store(frames, Ordering::Relaxed);
+        self.shared.paused.store(false, Ordering::Relaxed);
+        self.shared.recording.store(true, Ordering::Relaxed);
+        log::info!(
+            "re-recording started: {} (from frame {frames})",
+            dir.display()
+        );
+        self.emit(RecorderEvent::Started { dir });
     }
 
     fn start_or_report(&mut self, request: TakeRequest, use_preroll: bool) {
@@ -592,6 +829,7 @@ impl Worker {
             skip_silent,
             paused: false,
             peaks_valid: true,
+            fade_in_left: 0,
             dir: dir.clone(),
             tracks,
             meta,
@@ -696,7 +934,15 @@ impl Worker {
             .as_ref()
             .and_then(|p| p.start_at)
             .filter(|at| *at <= self.frames_seen);
-        if let Some(at) = due
+        let punch_due = self.punch_at.filter(|at| *at <= self.frames_seen);
+        if let Some(at) = punch_due
+            && let Some(take) = self.prepared.take()
+        {
+            self.punch_at = None;
+            let skip = at.saturating_sub(before) as usize * channels;
+            self.activate(take);
+            self.write(&samples[skip.min(samples.len())..]);
+        } else if let Some(at) = due
             && let Some(request) = self.pending.take()
         {
             // The take begins exactly at frame `at`: skip what came before it in this chunk.
@@ -725,6 +971,19 @@ impl Worker {
             for frame in interleaved.chunks_exact(channels) {
                 track.buf.extend(track.channels.iter().map(|&c| frame[c]));
             }
+            if take.fade_in_left > 0 {
+                let total = fade_frames(self.config.sample_rate);
+                let done = total - take.fade_in_left;
+                for (n, frame) in track
+                    .buf
+                    .chunks_exact_mut(track.channels.len())
+                    .take(take.fade_in_left)
+                    .enumerate()
+                {
+                    let gain = (done + n + 1) as f32 / total as f32;
+                    frame.iter_mut().for_each(|s| *s *= gain);
+                }
+            }
             track.peak = track.buf.iter().fold(track.peak, |p, s| p.max(s.abs()));
             for frame in track.buf.chunks_exact(track.lanes.len()) {
                 for (lane, s) in track.lanes.iter_mut().zip(frame) {
@@ -739,6 +998,9 @@ impl Worker {
                 break;
             }
         }
+        take.fade_in_left = take
+            .fade_in_left
+            .saturating_sub(interleaved.len() / channels);
         if let Some(first) = take.tracks.first() {
             self.shared
                 .frames
@@ -887,6 +1149,11 @@ impl Worker {
     }
 }
 
+/// Length of the fades around a re-recording join (5 ms).
+fn fade_frames(sample_rate: u32) -> usize {
+    (sample_rate / 200).max(1) as usize
+}
+
 fn bext_for(origin: NaiveDateTime, sample_rate: u32, dir: &Path, track: &str) -> Bext {
     let take_name = dir
         .file_name()
@@ -1005,7 +1272,9 @@ mod tests {
             match wait_event(r) {
                 RecorderEvent::Stopped(s) => return s,
                 RecorderEvent::Error(e) => panic!("unexpected error: {e}"),
-                RecorderEvent::Started { .. } | RecorderEvent::Cancelled => {}
+                RecorderEvent::Started { .. }
+                | RecorderEvent::Cancelled
+                | RecorderEvent::PunchReady { .. } => {}
             }
         }
     }
@@ -1416,6 +1685,103 @@ mod tests {
         rig.recorder.append(dir);
         assert!(matches!(wait_event(&rig.recorder), RecorderEvent::Error(_)));
         assert!(!rig.recorder.is_recording());
+    }
+
+    #[test]
+    fn re_recording_keeps_the_original_and_joins_old_and_new_audio() {
+        let mut rig = rig();
+        rig.recorder.start(one_track(rig.root.path()));
+        let RecorderEvent::Started { dir: original } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 100);
+        wait_until(|| rig.recorder.frames_recorded() == 100);
+        rig.recorder.add_marker();
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+        let before = fs::read(original.join("01_A.wav")).unwrap();
+
+        // Frames seen so far: 100. Re-record from frame 60 of the take, starting at input
+        // frame 130.
+        rig.recorder.prepare_punch(PunchRequest {
+            source: original.clone(),
+            at_frame: 60,
+            root: rig.root.path().to_owned(),
+            label: "redo".into(),
+        });
+        let RecorderEvent::PunchReady { dir, at_frame } = wait_event(&rig.recorder) else {
+            panic!("expected PunchReady");
+        };
+        assert_eq!(at_frame, 60);
+        assert_ne!(dir, original);
+        rig.recorder.start_punch(130);
+        feed(&mut rig.producer, 100, 80); // input frames 100..180: recording covers 130..180
+        assert_eq!(
+            wait_event(&rig.recorder),
+            RecorderEvent::Started { dir: dir.clone() }
+        );
+        wait_until(|| rig.recorder.frames_recorded() == 110);
+        rig.recorder.stop();
+        let summary = stopped(&rig.recorder);
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+
+        // The original is untouched.
+        assert_eq!(fs::read(original.join("01_A.wav")).unwrap(), before);
+
+        // RATE 1000 gives 5-frame fades on both sides of the join.
+        let out = read_float_wav(&dir.join("01_A.wav"));
+        assert_eq!(out.len(), 110);
+        assert_eq!(
+            out[..55],
+            (0..55).map(|n| sample(n, 0)).collect::<Vec<_>>()[..]
+        );
+        assert!(out[57].abs() < sample(57, 0).abs());
+        assert_eq!(out[59], 0.0);
+        assert!(out[60].abs() < sample(130, 0).abs());
+        assert_eq!(
+            out[65..],
+            (135..180).map(|n| sample(n, 0)).collect::<Vec<_>>()[..]
+        );
+
+        let meta = take::read_meta(&dir).unwrap();
+        assert_eq!(meta.frames, 110);
+        assert_eq!(meta.markers, vec![60]); // the old marker at 100 lies after the join
+        assert!(
+            dir.ends_with(take::take_dir_name(
+                chrono::NaiveDateTime::parse_from_str(&meta.started_at, "%Y-%m-%dT%H:%M:%S%.3f")
+                    .unwrap(),
+                "redo"
+            )) || dir.to_string_lossy().contains("redo")
+        );
+        assert_eq!(TakePeaks::load(&dir).unwrap().lanes[0].len(), 22);
+    }
+
+    #[test]
+    fn cancelling_a_prepared_re_recording_removes_its_folder() {
+        let mut rig = rig();
+        rig.recorder.start(one_track(rig.root.path()));
+        let RecorderEvent::Started { dir: original } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 50);
+        wait_until(|| rig.recorder.frames_recorded() == 50);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+
+        rig.recorder.prepare_punch(PunchRequest {
+            source: original.clone(),
+            at_frame: 20,
+            root: rig.root.path().to_owned(),
+            label: "redo".into(),
+        });
+        let RecorderEvent::PunchReady { dir, .. } = wait_event(&rig.recorder) else {
+            panic!("expected PunchReady");
+        };
+        rig.recorder.start_punch(1_000_000);
+        rig.recorder.stop();
+        assert_eq!(wait_event(&rig.recorder), RecorderEvent::Cancelled);
+        assert!(!dir.exists());
+        assert!(original.join("01_A.wav").exists());
     }
 
     #[test]

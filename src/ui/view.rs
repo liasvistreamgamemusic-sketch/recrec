@@ -650,9 +650,11 @@ impl RecrecApp {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         self.transport_state(ui, recording, rec_t);
                         // While counting in, the clock shows bars to go and the beat.
-                        let clock = match self.count_in_beat() {
-                            Some(c) => format!("-{} · {}", c.bars_left, c.beat),
-                            None => format_duration(self.elapsed_secs()),
+                        let clock = match (self.count_in_beat(), self.punch_countdown()) {
+                            (Some(c), _) => format!("-{} · {}", c.bars_left, c.beat),
+                            (None, Some(Some(secs))) => format!("-{secs:.1}"),
+                            (None, Some(None)) => "…".to_owned(),
+                            (None, None) => format_duration(self.elapsed_secs()),
                         };
                         ui.label(
                             RichText::new(clock)
@@ -804,6 +806,12 @@ impl RecrecApp {
                 "一時停止中 (P で再開)"
             } else if recording {
                 "録音中"
+            } else if let Some(countdown) = self.punch_countdown() {
+                if countdown.is_some() {
+                    "録り直し: まもなく録音 (Space で中止)"
+                } else {
+                    "録り直しの準備中…"
+                }
             } else if self.count_in_beat().is_some() {
                 "カウントイン (Space で中止)"
             } else if self.session_error.is_some() || self.session.is_none() {
@@ -1227,6 +1235,8 @@ impl RecrecApp {
         let mut rewind = false;
         let mut close = false;
         let mut append = false;
+        let mut punch = false;
+        let at_start = take.playhead == 0;
         let mut zoom: Option<f64> = None;
         let mut show_all = false;
 
@@ -1258,6 +1268,18 @@ impl RecrecApp {
                             .add_enabled(self.can_record(), Button::new("続きから録音"))
                             .on_hover_text(
                                 "このテイクの最後に続けて録音します (つなぎ目にマーカーが入ります)",
+                            )
+                            .clicked();
+                        punch = ui
+                            .add_enabled(
+                                self.can_record() && blocker.is_none() && !at_start && !playing,
+                                Button::new("ここから録り直す"),
+                            )
+                            .on_hover_text(
+                                "再生位置の 4 秒前から再生し、再生位置から録音し直します。\n                                 元のテイクは残り、新しいテイクが作られます",
+                            )
+                            .on_disabled_hover_text(
+                                "録り直したい位置を波形でクリックして選びます (再生中は使えません)",
                             )
                             .clicked();
                         if ui
@@ -1317,6 +1339,9 @@ impl RecrecApp {
         }
         if append {
             self.append_to_open_take();
+        }
+        if punch {
+            self.start_punch();
         }
         if close {
             self.close_take();

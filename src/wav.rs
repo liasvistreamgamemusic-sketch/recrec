@@ -130,6 +130,7 @@ pub struct WavWriter {
     rf64_threshold: u64,
     dither: Vec<Tpdf>,
     encode_buf: Vec<u8>,
+    dither_on: bool,
     finalized: bool,
 }
 
@@ -153,6 +154,7 @@ impl WavWriter {
             rf64_threshold: u64::from(u32::MAX),
             dither,
             encode_buf: Vec::new(),
+            dither_on: true,
             finalized: false,
         })
     }
@@ -190,8 +192,15 @@ impl WavWriter {
             rf64_threshold: u64::from(u32::MAX),
             dither,
             encode_buf: Vec::new(),
+            dither_on: true,
             finalized: false,
         })
+    }
+
+    /// Turns the 16-bit dither off (for copying audio that was already quantized: it then
+    /// comes out bit-identical) or back on.
+    pub fn set_dither(&mut self, on: bool) {
+        self.dither_on = on;
     }
 
     pub fn spec(&self) -> WavSpec {
@@ -217,7 +226,8 @@ impl WavWriter {
             SampleFormat::Pcm16 => {
                 for frame in interleaved.chunks_exact(channels) {
                     for (x, dither) in frame.iter().zip(self.dither.iter_mut()) {
-                        let v = (x * SCALE_16 + dither.sample()).round();
+                        let noise = if self.dither_on { dither.sample() } else { 0.0 };
+                        let v = (x * SCALE_16 + noise).round();
                         let v = v.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         self.encode_buf.extend_from_slice(&v.to_le_bytes());
                     }
@@ -1007,6 +1017,32 @@ mod tests {
             .read(0, 10, &mut out)
             .unwrap();
         assert_eq!(out, [0.5, 0.25, 0.125]);
+    }
+
+    #[test]
+    fn copying_16bit_audio_without_dither_is_bit_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.wav");
+        let b = dir.path().join("b.wav");
+        let s = spec(1, SampleFormat::Pcm16);
+        let mut w = WavWriter::create(&a, s, &bext(), 5).unwrap();
+        w.write_samples(
+            &(0..500)
+                .map(|i| (i as f32 * 0.03).sin() * 0.7)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        w.finalize().unwrap();
+        let mut decoded = Vec::new();
+        WavReader::open(&a)
+            .unwrap()
+            .read(0, 500, &mut decoded)
+            .unwrap();
+        let mut w = WavWriter::create(&b, s, &bext(), 9).unwrap();
+        w.set_dither(false);
+        w.write_samples(&decoded).unwrap();
+        w.finalize().unwrap();
+        assert_eq!(data_of(&a), data_of(&b));
     }
 
     #[test]

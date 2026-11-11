@@ -15,7 +15,7 @@ use crate::config::{self, AppConfig};
 use crate::meter::MeterDisplay;
 use crate::metronome::{self, TapTempo};
 use crate::platform::SleepGuard;
-use crate::recorder::{RecorderEvent, TakeRequest, TrackRequest};
+use crate::recorder::{PunchRequest, RecorderEvent, TakeRequest, TrackRequest};
 use crate::take::{self, TakeEntry, Tempo};
 use crate::track::{self, Track};
 use crate::transport::{MAX_BPM, MIN_BPM};
@@ -94,6 +94,18 @@ pub(super) struct TakeEdit {
     pub confirm_delete: bool,
 }
 
+/// Progress of a re-recording from a point of the open take.
+#[derive(Debug, Clone, Copy)]
+enum Punch {
+    /// The writer thread is copying the part of the take that is kept.
+    Preparing,
+    /// The lead-in is playing; recording starts at this output frame.
+    Rolling { record_at_out: u64 },
+}
+
+/// Seconds of the old take played before a re-recording starts.
+const PUNCH_LEAD_IN_SECONDS: f64 = 4.0;
+
 /// Lead time between pressing record and the first beat, so the click starts cleanly.
 const START_LEAD_SECONDS: f64 = 0.05;
 
@@ -133,6 +145,7 @@ pub struct RecrecApp {
     pub(super) open_take: Option<OpenTake>,
     /// Horizontal extent of the track lanes in the last frame (aligns the time ruler).
     pub(super) lane_span: Option<(f32, f32)>,
+    punch: Option<Punch>,
     pub(super) update: UpdateState,
     /// Events of the running update thread, if any.
     update_rx: Option<Receiver<UpdateEvent>>,
@@ -185,6 +198,7 @@ impl RecrecApp {
             take_edit: None,
             open_take: None,
             lane_span: None,
+            punch: None,
             update: UpdateState::Idle,
             update_rx: None,
             self_update_supported: crate::platform::is_installed_build()
@@ -743,6 +757,63 @@ impl RecrecApp {
         self.start_pending = true;
     }
 
+    /// Re-records from the playhead: the open take stays as it is, and a new take is made
+    /// from its beginning up to the playhead plus what is recorded now.
+    pub(super) fn start_punch(&mut self) {
+        if self.is_busy() || !self.can_record() || self.playback_blocker().is_some() {
+            return;
+        }
+        let (Some(take), Some(session)) = (&self.open_take, &self.session) else {
+            return;
+        };
+        if take.playhead == 0 {
+            return;
+        }
+        session.player.stop();
+        self.dropped_at_take_start = session.dropped_frames();
+        session.recorder().prepare_punch(PunchRequest {
+            source: take.dir.clone(),
+            at_frame: take.playhead,
+            root: self.config.output_dir(),
+            label: take::label_of(&take.name).to_owned(),
+        });
+        self.start_pending = true;
+        self.punch = Some(Punch::Preparing);
+    }
+
+    /// The kept part is written: play the lead-in and schedule the recording at its end.
+    fn roll_punch(&mut self, at_frame: u64) {
+        let Some(session) = &self.session else { return };
+        let rate = f64::from(session.info.sample_rate);
+        let lead = (rate * START_LEAD_SECONDS) as u64;
+        let lead_in = at_frame.min((rate * PUNCH_LEAD_IN_SECONDS) as u64);
+        let comp = (f64::from(self.config.latency_comp_ms) / 1000.0 * rate).round() as i64;
+        let t = &session.transport;
+        let gate_out = t.out_frames() + lead;
+        session
+            .player
+            .play(at_frame - lead_in, Some(at_frame), gate_out);
+        session
+            .recorder()
+            .start_punch((t.in_frames() + lead + lead_in).saturating_add_signed(comp));
+        self.punch = Some(Punch::Rolling {
+            record_at_out: gate_out + lead_in,
+        });
+    }
+
+    /// While a re-recording is being set up: seconds until recording starts (`None` while
+    /// the kept part is still being copied).
+    pub(super) fn punch_countdown(&self) -> Option<Option<f64>> {
+        let s = self.session.as_ref()?;
+        Some(match self.punch? {
+            Punch::Preparing => None,
+            Punch::Rolling { record_at_out } => Some(
+                record_at_out.saturating_sub(s.transport.out_frames()) as f64
+                    / f64::from(s.info.sample_rate),
+            ),
+        })
+    }
+
     pub(super) fn is_paused(&self) -> bool {
         self.session
             .as_ref()
@@ -818,13 +889,19 @@ impl RecrecApp {
             RecorderEvent::Cancelled => {
                 self.start_pending = false;
                 self.count_in = None;
-                self.push(Level::Info, "カウントインを中止しました");
+                self.punch = None;
+                if let Some(s) = &self.session {
+                    s.player.stop();
+                }
+                self.push(Level::Info, "録音の開始を中止しました");
             }
+            RecorderEvent::PunchReady { at_frame, .. } => self.roll_punch(at_frame),
             RecorderEvent::Started { dir } => {
                 self.start_pending = false;
                 self.count_in = None;
                 self.rec_wave_start = self.session.as_ref().map(|s| s.waves.total_blocks());
                 self.marker_blocks.clear();
+                self.punch = None;
                 // While recording, the lanes show the live input.
                 self.close_take();
                 self.sleep_guard = Some(SleepGuard::new());
@@ -875,6 +952,7 @@ impl RecrecApp {
                 self.open_take(&summary.dir);
             }
             RecorderEvent::Error(msg) => {
+                self.punch = None;
                 self.start_pending = false;
                 self.count_in = None;
                 self.push(Level::Error, msg);
