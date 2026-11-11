@@ -5,6 +5,7 @@ pub mod meter;
 pub mod metronome;
 pub mod peaks;
 pub mod platform;
+pub mod player;
 pub mod recorder;
 pub mod take;
 pub mod track;

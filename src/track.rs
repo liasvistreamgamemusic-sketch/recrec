@@ -112,6 +112,28 @@ impl Track {
     }
 }
 
+/// Playback gain `(left, right)` of a recorded track whose row is `track` (`None` when no
+/// row matches it: such tracks play centered at full level). Mute, solo, volume and pan
+/// apply; the monitor switch does not (it only concerns live input).
+pub fn playback_gain(track: Option<&Track>, any_solo: bool) -> (f32, f32) {
+    let Some(t) = track else {
+        return if any_solo { (0.0, 0.0) } else { (1.0, 1.0) };
+    };
+    if t.mute || (any_solo && !t.solo) {
+        return (0.0, 0.0);
+    }
+    let volume = 10f32.powf(t.volume_db.clamp(MIN_VOLUME_DB, MAX_VOLUME_DB) / 20.0);
+    let pan = t.pan.clamp(-1.0, 1.0);
+    match t.source {
+        Source::Mono(_) => {
+            let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            let norm = std::f32::consts::SQRT_2;
+            (angle.cos() * norm * volume, angle.sin() * norm * volume)
+        }
+        Source::Stereo(..) => ((1.0 - pan).min(1.0) * volume, (1.0 + pan).min(1.0) * volume),
+    }
+}
+
 /// Monitor gain `(left, right)` of every input channel for the current track settings.
 /// A channel used by several audible tracks is heard once per track.
 pub fn monitor_gains(tracks: &[Track], in_channels: usize) -> Vec<(f32, f32)> {
@@ -296,6 +318,26 @@ mod tests {
         // Solo on a track that is not monitored silences nobody.
         b.monitor = false;
         assert!(close(monitor_gains(&[a, b], 2)[0], (1.0, 1.0)));
+    }
+
+    #[test]
+    fn playback_gain_follows_mute_solo_volume_and_pan() {
+        let mut t = Track::mono(0);
+        assert!(close(playback_gain(Some(&t), false), (1.0, 1.0)));
+        assert!(close(playback_gain(None, false), (1.0, 1.0)));
+        t.volume_db = -6.0206;
+        assert!(close(playback_gain(Some(&t), false), (0.5, 0.5)));
+        t.mute = true;
+        assert!(close(playback_gain(Some(&t), false), (0.0, 0.0)));
+        t.mute = false;
+        // Someone else is soloed: this track and unmatched tracks fall silent.
+        assert!(close(playback_gain(Some(&t), true), (0.0, 0.0)));
+        assert!(close(playback_gain(None, true), (0.0, 0.0)));
+        t.solo = true;
+        assert!(close(playback_gain(Some(&t), true), (0.5, 0.5)));
+        let mut s = Track::new("S".into(), Source::Stereo(0, 1));
+        s.pan = -1.0;
+        assert!(close(playback_gain(Some(&s), false), (1.0, 0.0)));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{BufferSize, FromSample, HostId, Sample, SampleFormat, SizedSample, StreamConfig};
 
 use crate::metronome;
+use crate::player::PlaybackTap;
 use crate::transport::Transport;
 
 /// Time constant of gain changes: long enough to hide clicks, short enough to feel instant.
@@ -26,6 +27,7 @@ pub struct OutputMixer {
     click_gain: f32,
     master_gain: f32,
     smoothing: f32,
+    playback: Option<PlaybackTap>,
 }
 
 impl OutputMixer {
@@ -41,7 +43,14 @@ impl OutputMixer {
             click_gain: 0.0,
             master_gain: 0.0,
             smoothing: 1.0 - (-1.0 / (SMOOTHING_SECONDS * sample_rate as f32)).exp(),
+            playback: None,
         }
+    }
+
+    /// Adds take playback to the mix.
+    pub fn with_playback(mut self, tap: PlaybackTap) -> Self {
+        self.playback = Some(tap);
+        self
     }
 
     /// Fills one interleaved output buffer. Channels 1-2 carry the mix; the rest stay silent.
@@ -78,9 +87,18 @@ impl OutputMixer {
         let (a, b) = chunk.as_ref().map_or((&[][..], &[][..]), |c| c.as_slices());
         let mut input = a.iter().chain(b);
 
+        if let Some(tap) = &mut self.playback {
+            tap.begin_buffer();
+        }
         let k = self.smoothing;
         for (i, frame) in out.chunks_exact_mut(out_channels).enumerate() {
             let (mut left, mut right) = (0.0f32, 0.0f32);
+            if let Some(tap) = &mut self.playback
+                && let Some((l, r)) = tap.next_frame(start + i as u64)
+            {
+                left += l;
+                right += r;
+            }
             if i < have {
                 for (gain, target) in self.gains.iter_mut().zip(&self.targets) {
                     gain.0 += (target.0 - gain.0) * k;

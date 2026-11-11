@@ -12,6 +12,7 @@ use super::capture::{Capture, SUPPORTED_FORMATS, Taps};
 use super::output::{self, OutputMixer};
 use super::{channel_names, devices};
 use crate::meter::MeterBank;
+use crate::player::Player;
 use crate::recorder::{Recorder, RecorderConfig, RecorderEvent};
 use crate::track;
 use crate::transport::Transport;
@@ -48,6 +49,8 @@ pub struct InputSession {
     /// Why nothing can be played (metronome and monitoring are then unavailable).
     pub output_error: Option<String>,
     pub waves: WaveHistory,
+    /// Plays back recorded takes through the output.
+    pub player: Player,
     wave_ring: rtrb::Consumer<f32>,
     dropped_frames: Arc<AtomicU64>,
     stream_errors: Receiver<String>,
@@ -104,7 +107,9 @@ impl InputSession {
                 format!("「{device_name}」を {sample_rate} Hz / {channels} ch で開けません")
             })?;
         // Build the output before starting anything: ASIO sets up both directions together.
-        let mixer = OutputMixer::new(monitor_rx, transport.clone(), sample_rate);
+        let (player, playback_tap) = Player::spawn().context("再生スレッドを起動できません")?;
+        let mixer = OutputMixer::new(monitor_rx, transport.clone(), sample_rate)
+            .with_playback(playback_tap);
         let (output, output_error) =
             match output::open(host_id, &device, sample_rate, buffer_size, mixer) {
                 Ok(out) => (Some(out), None),
@@ -152,6 +157,7 @@ impl InputSession {
             transport,
             output_error,
             waves: WaveHistory::new(channels),
+            player,
             wave_ring,
             dropped_frames,
             stream_errors: err_rx,
