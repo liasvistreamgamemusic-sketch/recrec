@@ -500,6 +500,7 @@ impl RecrecApp {
             device: session.info.device.clone(),
             start_at,
             tempo,
+            skip_silent: self.config.skip_silent_tracks,
         };
         self.dropped_at_take_start = session.dropped_frames();
         session.recorder().start(request);
@@ -706,6 +707,15 @@ impl RecrecApp {
                     Level::Warn
                 };
                 self.push(level, text);
+                if !summary.skipped_silent.is_empty() {
+                    self.push(
+                        Level::Info,
+                        format!(
+                            "無音だったため保存しなかったトラック: {}",
+                            summary.skipped_silent.join(", ")
+                        ),
+                    );
+                }
                 for e in summary.errors {
                     self.push(Level::Error, e);
                 }

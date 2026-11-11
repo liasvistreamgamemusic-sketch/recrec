@@ -37,6 +37,10 @@ pub struct AppConfig {
     /// Shifts the start of a counted-in take to make up for the interface's round-trip
     /// latency, in milliseconds (positive = start later).
     pub latency_comp_ms: f32,
+    /// Do not keep the files of tracks that stayed silent for a whole take.
+    pub skip_silent_tracks: bool,
+    /// Whether the take list is folded away to give the tracks more room.
+    pub takes_collapsed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +125,8 @@ impl Default for AppConfig {
             metronome: MetronomeConfig::default(),
             output_volume: 1.0,
             latency_comp_ms: 0.0,
+            skip_silent_tracks: true,
+            takes_collapsed: false,
         }
     }
 }
@@ -209,6 +215,8 @@ mod tests {
             },
             output_volume: 0.8,
             latency_comp_ms: 12.5,
+            skip_silent_tracks: false,
+            takes_collapsed: true,
         };
         cfg.tracks.insert(
             device_key("ASIO", "Audio Interface"),

@@ -14,6 +14,9 @@ use crate::take::{self, TakeMeta, Tempo, TrackMeta};
 use crate::wav::{Bext, SampleFormat, WavSpec, WavWriter};
 
 pub const MAX_PREROLL_SECS: u32 = 30;
+/// A track whose peak never reaches this level (-60 dBFS) counts as silent: far below any
+/// connected source, above the idle noise of an unused input.
+pub const SILENCE_PEAK: f32 = 0.001;
 
 /// Timing and safety thresholds of the writer thread.
 #[derive(Debug, Clone)]
@@ -61,12 +64,16 @@ pub struct TakeRequest {
     /// the files begin. `None` starts immediately and keeps the pre-roll.
     pub start_at: Option<u64>,
     pub tempo: Option<Tempo>,
+    /// Do not keep the files of tracks that stayed silent for the whole take.
+    pub skip_silent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TakeSummary {
     pub dir: PathBuf,
     pub files: Vec<PathBuf>,
+    /// Names of the tracks whose silent files were not kept.
+    pub skipped_silent: Vec<String>,
     pub frames: u64,
     pub dropped_frames: u64,
     pub errors: Vec<String>,
@@ -231,9 +238,12 @@ struct OpenTrack {
     channels: Vec<usize>,
     path: PathBuf,
     buf: Vec<f32>,
+    /// Highest absolute sample written so far.
+    peak: f32,
 }
 
 struct ActiveTake {
+    skip_silent: bool,
     dir: PathBuf,
     tracks: Vec<OpenTrack>,
     meta: TakeMeta,
@@ -394,6 +404,7 @@ impl Worker {
             .map_err(|e| format!("テイクフォルダを作れません: {e}"))?;
         take::create_marker(&dir).map_err(|e| format!("テイクフォルダに書き込めません: {e}"))?;
 
+        let skip_silent = request.skip_silent;
         let (tracks, meta) = match self.open_files(&dir, request, origin, preroll_frames) {
             Ok(opened) => opened,
             Err(msg) => {
@@ -408,6 +419,7 @@ impl Worker {
 
         let now = Instant::now();
         self.take = Some(ActiveTake {
+            skip_silent,
             dir: dir.clone(),
             tracks,
             meta,
@@ -458,6 +470,7 @@ impl Worker {
                 channels: t.channels.clone(),
                 path,
                 buf: Vec::new(),
+                peak: 0.0,
             });
         }
 
@@ -476,6 +489,7 @@ impl Worker {
             note: String::new(),
             tempo: request.tempo,
             markers: Vec::new(),
+            skipped_silent: Vec::new(),
         };
         take::write_meta(dir, &meta).map_err(|e| format!("take.json を書けません: {e}"))?;
         Ok((tracks, meta))
@@ -533,6 +547,7 @@ impl Worker {
             for frame in interleaved.chunks_exact(channels) {
                 track.buf.extend(track.channels.iter().map(|&c| frame[c]));
             }
+            track.peak = track.buf.iter().fold(track.peak, |p, s| p.max(s.abs()));
             if let Err(e) = track.writer.write_samples(&track.buf) {
                 failure = Some(format!(
                     "{} への書き込みに失敗しました: {e}",
@@ -606,6 +621,31 @@ impl Worker {
             .dropped_frames
             .load(Ordering::Relaxed)
             .saturating_sub(take.dropped_at_start);
+        // Unused inputs would otherwise leave a silent file per take. Only when the take
+        // closed cleanly, and never all of them (an all-silent take is kept as recorded).
+        let silent: Vec<usize> = take
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.peak < SILENCE_PEAK)
+            .map(|(i, _)| i)
+            .collect();
+        let mut skipped_silent = Vec::new();
+        if take.skip_silent && errors.is_empty() && silent.len() < take.tracks.len() {
+            for i in silent.into_iter().rev() {
+                match std::fs::remove_file(&files[i]) {
+                    Ok(()) => {
+                        files.remove(i);
+                        skipped_silent.insert(0, take.meta.tracks.remove(i).name);
+                    }
+                    Err(e) => errors.push(format!(
+                        "無音のファイル {} を消せません: {e}",
+                        files[i].display()
+                    )),
+                }
+            }
+        }
+        take.meta.skipped_silent = skipped_silent.clone();
         take.meta.frames = frames;
         take.meta.markers = std::mem::take(&mut take.markers);
         take.meta.dropped_frames = dropped;
@@ -632,6 +672,7 @@ impl Worker {
         self.emit(RecorderEvent::Stopped(TakeSummary {
             dir: take.dir,
             files,
+            skipped_silent,
             frames,
             dropped_frames: dropped,
             errors,
@@ -715,6 +756,7 @@ mod tests {
             device: "Fake".into(),
             start_at: None,
             tempo: None,
+            skip_silent: false,
         }
     }
 
@@ -990,6 +1032,76 @@ mod tests {
         );
         // The audio itself is untouched by the trailing chunk.
         assert_eq!(read_float_wav(&dir.join("01_A.wav")).len(), 150);
+    }
+
+    fn feed_with_silent_channels(p: &mut rtrb::Producer<f32>, frames: usize, loud: &[usize]) {
+        for n in 0..frames {
+            for c in 0..CH {
+                let v = if loud.contains(&c) {
+                    sample(n + 1, c)
+                } else {
+                    0.0
+                };
+                p.push(v).unwrap();
+            }
+        }
+    }
+
+    fn three_tracks(root: &Path, skip_silent: bool) -> TakeRequest {
+        let track = |name: &str, c: usize| TrackRequest {
+            name: name.into(),
+            channels: vec![c],
+        };
+        let mut req = request(root, vec![track("A", 0), track("B", 1), track("C", 2)]);
+        req.skip_silent = skip_silent;
+        req
+    }
+
+    #[test]
+    fn silent_tracks_are_not_kept_when_asked() {
+        let mut rig = rig();
+        rig.recorder.start(three_tracks(rig.root.path(), true));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed_with_silent_channels(&mut rig.producer, 200, &[1]);
+        wait_until(|| rig.recorder.frames_recorded() == 200);
+        rig.recorder.stop();
+        let summary = stopped(&rig.recorder);
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(summary.skipped_silent, ["A", "C"]);
+        assert_eq!(summary.files, [dir.join("02_B.wav")]);
+        assert!(!dir.join("01_A.wav").exists() && !dir.join("03_C.wav").exists());
+        let meta = take::read_meta(&dir).unwrap();
+        assert_eq!(meta.tracks.len(), 1);
+        assert_eq!(meta.tracks[0].file, "02_B.wav");
+        assert_eq!(meta.skipped_silent, ["A", "C"]);
+    }
+
+    #[test]
+    fn silent_tracks_are_kept_by_default_and_when_everything_is_silent() {
+        let mut rig = rig();
+        rig.recorder.start(three_tracks(rig.root.path(), false));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed_with_silent_channels(&mut rig.producer, 50, &[1]);
+        wait_until(|| rig.recorder.frames_recorded() == 50);
+        rig.recorder.stop();
+        assert_eq!(stopped(&rig.recorder).files.len(), 3);
+        assert!(dir.join("01_A.wav").exists());
+
+        rig.recorder.start(three_tracks(rig.root.path(), true));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed_with_silent_channels(&mut rig.producer, 50, &[]);
+        wait_until(|| rig.recorder.frames_recorded() == 50);
+        rig.recorder.stop();
+        let summary = stopped(&rig.recorder);
+        assert_eq!(summary.files.len(), 3);
+        assert!(summary.skipped_silent.is_empty());
+        assert!(dir.join("01_A.wav").exists());
     }
 
     #[test]

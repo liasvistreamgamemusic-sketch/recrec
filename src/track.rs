@@ -154,19 +154,19 @@ pub fn is_loopback_name(name: &str) -> bool {
     name.to_lowercase().contains("loop")
 }
 
-/// One armed mono track per physical input. Loopback inputs get no track (they can be added
-/// by hand); if every input looks like a loopback, all of them are used.
+/// One mono track per input. Physical inputs are armed; loopback inputs are listed but not
+/// armed, so they are recorded only when the user turns them on. If every input looks like
+/// a loopback, all of them are armed.
 pub fn default_tracks_for(names: &[String]) -> Vec<Track> {
-    let physical = |name: &&String| !is_loopback_name(name);
-    let keep_all = !names.iter().any(|n| physical(&n));
+    let all_loopback = names.iter().all(|n| is_loopback_name(n));
     names
         .iter()
         .enumerate()
-        .filter(|(_, name)| keep_all || physical(name))
         .map(|(c, name)| {
             let mut t = Track::mono(c as u16);
             t.name = name.split_whitespace().collect();
             t.loopback = is_loopback_name(name);
+            t.armed = all_loopback || !t.loopback;
             t
         })
         .collect()
@@ -323,12 +323,26 @@ mod tests {
     }
 
     #[test]
-    fn default_tracks_skip_loopback_inputs() {
+    fn default_tracks_list_loopback_inputs_but_do_not_arm_them() {
         let tracks = default_tracks_for(&motu_names());
         let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["In1", "In2", "In3", "In4"]);
+        assert_eq!(
+            names,
+            [
+                "In1",
+                "In2",
+                "In3",
+                "In4",
+                "Loopback1",
+                "Loopback2",
+                "LoopMix1",
+                "LoopMix2"
+            ]
+        );
         assert_eq!(tracks[3].source, Source::Mono(3));
-        assert!(tracks.iter().all(|t| t.armed && !t.loopback));
+        let armed: Vec<bool> = tracks.iter().map(|t| t.armed).collect();
+        assert_eq!(armed, [true, true, true, true, false, false, false, false]);
+        assert!(tracks[4..].iter().all(|t| t.loopback));
     }
 
     #[test]
@@ -336,7 +350,7 @@ mod tests {
         let names = vec!["Loopback L".to_owned(), "Loopback R".to_owned()];
         let tracks = default_tracks_for(&names);
         assert_eq!(tracks.len(), 2);
-        assert!(tracks.iter().all(|t| t.loopback));
+        assert!(tracks.iter().all(|t| t.loopback && t.armed));
     }
 
     #[test]

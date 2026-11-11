@@ -124,6 +124,9 @@ pub struct TakeMeta {
     /// Marker positions in frames from the start of the files.
     #[serde(default)]
     pub markers: Vec<u64>,
+    /// Tracks that stayed silent and were therefore not kept.
+    #[serde(default)]
+    pub skipped_silent: Vec<String>,
 }
 
 impl TakeMeta {
@@ -360,6 +363,7 @@ mod tests {
             note: String::new(),
             tempo: None,
             markers: Vec::new(),
+            skipped_silent: Vec::new(),
         }
     }
 
@@ -434,7 +438,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let json = serde_json::to_value(meta()).unwrap();
         let mut old = json.as_object().unwrap().clone();
-        for key in ["note", "tempo", "markers"] {
+        for key in ["note", "tempo", "markers", "skipped_silent"] {
             old.remove(key);
         }
         fs::write(

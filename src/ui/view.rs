@@ -29,6 +29,7 @@ use crate::waveform;
 
 const SIDEBAR_WIDTH: f32 = 288.0;
 const TAKES_WIDTH: f32 = 340.0;
+const TAKES_RAIL_WIDTH: f32 = 52.0;
 /// Width of the controls at the left of a track row.
 const TRACK_HEADER_WIDTH: f32 = 232.0;
 const TRACK_SOURCE_WIDTH: f32 = 112.0;
@@ -74,11 +75,33 @@ impl RecrecApp {
             .resizable(false)
             .frame(panel(Margin::same(20)))
             .show(ui, |ui| self.sidebar(ui));
+        // The take list folds into a narrow rail so the track lanes can use the width.
+        let collapsed = self.config.takes_collapsed;
+        let takes_width = theme::animate_value(
+            &ctx,
+            Id::unique("takes_width"),
+            if collapsed {
+                TAKES_RAIL_WIDTH
+            } else {
+                TAKES_WIDTH
+            },
+            theme::DURATION_BASE,
+        );
         egui::Panel::right("takes")
-            .exact_size(TAKES_WIDTH)
+            .exact_size(takes_width)
             .resizable(false)
-            .frame(panel(Margin::same(20)))
-            .show(ui, |ui| self.take_panel(ui));
+            .frame(panel(if collapsed {
+                Margin::symmetric(12, 20)
+            } else {
+                Margin::same(20)
+            }))
+            .show(ui, |ui| {
+                if collapsed {
+                    self.take_rail(ui);
+                } else {
+                    self.take_panel(ui);
+                }
+            });
         egui::CentralPanel::no_frame()
             .frame(panel(Margin::same(20)))
             .show(ui, |ui| {
@@ -389,6 +412,22 @@ impl RecrecApp {
     }
 
     fn recording_fields(&mut self, ui: &mut Ui) {
+        self.recording_format_fields(ui);
+        ui.add_space(theme::SPACE_XXS);
+        let mut skip = self.config.skip_silent_tracks;
+        if ui
+            .checkbox(&mut skip, "無音のトラックは保存しない")
+            .on_hover_text(
+                "テイクの最初から最後まで -60 dB を超えなかったトラック (何もつないでいない入力など) の\n                 ファイルを残しません。全トラックが無音のときはそのまま残します",
+            )
+            .changed()
+        {
+            self.config.skip_silent_tracks = skip;
+            self.mark_dirty();
+        }
+    }
+
+    fn recording_format_fields(&mut self, ui: &mut Ui) {
         field_label(ui, "形式");
         let labels: Vec<&str> = SampleFormat::ALL.iter().map(|f| f.short_label()).collect();
         let selected = SampleFormat::ALL
@@ -815,8 +854,8 @@ impl RecrecApp {
                             .frame(false),
                         )
                         .on_hover_text(
-                            "物理入力 1 つにつきモノラル 1 トラックの構成に戻します \
-                             (ループバック入力は含めません)",
+                            "入力 1 つにつきモノラル 1 トラックの構成に戻します \
+                             (ループバック入力は録音オフの状態で並びます)",
                         )
                         .clicked()
                     {
@@ -1056,6 +1095,17 @@ impl RecrecApp {
                     .color(theme::INK_SUBTLE),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(
+                    ui,
+                    icon::CARET_DOUBLE_RIGHT,
+                    "テイクの一覧を折りたたむ (トラックを広く表示)",
+                    false,
+                )
+                .clicked()
+                {
+                    self.config.takes_collapsed = true;
+                    self.mark_dirty();
+                }
                 if icon_button(ui, icon::ARROWS_CLOCKWISE, "一覧を更新", false).clicked() {
                     refresh = true;
                 }
@@ -1104,6 +1154,24 @@ impl RecrecApp {
         if refresh {
             self.refresh_takes();
         }
+    }
+
+    /// The folded take list: just a button to bring it back and the number of takes.
+    fn take_rail(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            if icon_button(ui, icon::CARET_DOUBLE_LEFT, "テイクの一覧を表示", false).clicked()
+            {
+                self.config.takes_collapsed = false;
+                self.mark_dirty();
+            }
+            ui.add_space(theme::SPACE_XS);
+            ui.label(
+                RichText::new(self.takes.len().to_string())
+                    .font(theme::mono(theme::TEXT_SMALL))
+                    .color(theme::INK_SUBTLE),
+            )
+            .on_hover_text("テイクの数");
+        });
     }
 
     /// Dialog for renaming a take, attaching a note, or moving it to the Recycle Bin.

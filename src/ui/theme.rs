@@ -258,6 +258,8 @@ pub mod icon {
     pub const ARROWS_CLOCKWISE: &str = "\u{E094}";
     pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
     pub const BELL: &str = "\u{E0CE}";
+    pub const CARET_DOUBLE_LEFT: &str = "\u{E128}";
+    pub const CARET_DOUBLE_RIGHT: &str = "\u{E12A}";
     pub const CHECK_CIRCLE: &str = "\u{E184}";
     pub const DOTS_SIX_VERTICAL: &str = "\u{EAE2}";
     pub const FILE_AUDIO: &str = "\u{EA20}";
