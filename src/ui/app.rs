@@ -117,8 +117,6 @@ pub struct RecrecApp {
     pub(super) messages: Vec<Message>,
     pub(super) free_space: Option<u64>,
     pub(super) total_space: Option<u64>,
-    /// Horizontal extent of the track meters in the last frame (aligns the dB scale).
-    pub(super) meter_span: Option<(f32, f32)>,
     last_space_check: Option<Instant>,
     pub(super) pending_drag: Option<Vec<PathBuf>>,
     tap: TapTempo,
@@ -172,7 +170,6 @@ impl RecrecApp {
             messages: Vec::new(),
             free_space: None,
             total_space: None,
-            meter_span: None,
             last_space_check: None,
             pending_drag: None,
             tap: TapTempo::default(),

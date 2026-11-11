@@ -6,7 +6,8 @@ use eframe::egui::{
 };
 
 use super::theme::{self, icon};
-use crate::meter::{METER_FLOOR_DB, MeterDisplay};
+use crate::meter::{CLIP_THRESHOLD, METER_FLOOR_DB, MeterDisplay};
+use crate::waveform::WaveHistory;
 
 const GREEN_BELOW_DB: f32 = -18.0;
 const YELLOW_BELOW_DB: f32 = -6.0;
@@ -21,28 +22,27 @@ fn focus_stroke() -> Stroke {
     Stroke::new(2.0, theme::ACCENT)
 }
 
-fn x_for_db(rect: Rect, db: f32) -> f32 {
-    let t = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
-    rect.left() + t * rect.width()
+/// Height fraction (0 = floor, 1 = full scale) of a level in dB.
+fn level_fraction(db: f32) -> f32 {
+    ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
 }
 
-fn paint_meter_bar(ui: &Ui, rect: Rect, display: &MeterDisplay) {
+fn paint_vmeter_bar(ui: &Ui, rect: Rect, display: &MeterDisplay) {
     let painter = ui.painter_at(rect);
-    let radius = CornerRadius::same(2);
-    painter.rect_filled(rect, radius, theme::SURFACE_3);
-
-    let level_x = x_for_db(rect, display.level_db);
+    painter.rect_filled(rect, CornerRadius::same(2), theme::SURFACE_3);
+    let y_for = |db: f32| rect.bottom() - level_fraction(db) * rect.height();
+    let level_y = y_for(display.level_db);
     let zones = [
         (METER_FLOOR_DB, GREEN_BELOW_DB, theme::METER_LOW),
         (GREEN_BELOW_DB, YELLOW_BELOW_DB, theme::METER_MID),
         (YELLOW_BELOW_DB, 0.0, theme::METER_HIGH),
     ];
     for (from, to, color) in zones {
-        let left = x_for_db(rect, from);
-        let right = x_for_db(rect, to).min(level_x);
-        if right > left {
+        let bottom = y_for(from);
+        let top = y_for(to).max(level_y);
+        if bottom > top {
             painter.rect_filled(
-                Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom())),
+                Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom)),
                 0.0,
                 color,
             );
@@ -51,61 +51,128 @@ fn paint_meter_bar(ui: &Ui, rect: Rect, display: &MeterDisplay) {
     // Segment gaps give the bar its LED look and make level easier to judge at a glance.
     let mut db = METER_FLOOR_DB + SEGMENT_DB;
     while db < 0.0 {
-        let x = x_for_db(rect, db).round();
+        let y = y_for(db).round();
         painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
             Stroke::new(1.0, theme::SURFACE_1),
         );
         db += SEGMENT_DB;
     }
     if display.hold_db > METER_FLOOR_DB {
-        let x = x_for_db(rect, display.hold_db);
+        let y = y_for(display.hold_db);
         painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
             Stroke::new(2.0, theme::INK),
         );
     }
 }
 
-/// One bar per channel (stacked for stereo) inside `size`. Returns the allocated rect.
-pub fn meter(ui: &mut Ui, channels: &[&MeterDisplay], size: Vec2) -> Rect {
+/// Vertical level meter, one bar per channel side by side.
+pub fn vmeter(ui: &mut Ui, channels: &[&MeterDisplay], size: Vec2) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let gap = 2.0;
     let n = channels.len().max(1) as f32;
-    let bar_height = (rect.height() - gap * (n - 1.0)) / n;
+    let bar_width = (rect.width() - gap * (n - 1.0)) / n;
     let mut hold = METER_FLOOR_DB;
     for (i, display) in channels.iter().enumerate() {
-        let top = rect.top() + i as f32 * (bar_height + gap);
+        let left = rect.left() + i as f32 * (bar_width + gap);
         let bar = Rect::from_min_size(
-            Pos2::new(rect.left(), top),
-            Vec2::new(rect.width(), bar_height),
+            Pos2::new(left, rect.top()),
+            Vec2::new(bar_width, rect.height()),
         );
-        paint_meter_bar(ui, bar, display);
+        paint_vmeter_bar(ui, bar, display);
         hold = hold.max(display.hold_db);
     }
     response.on_hover_text(format!("ピーク {} dBFS", db_label(hold)));
-    rect
 }
 
-/// dB tick labels drawn above the meters, spanning `left..right`.
-pub fn meter_scale(ui: &mut Ui, left: f32, right: f32) {
-    let height = 14.0;
-    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
-    let span = Rect::from_min_max(Pos2::new(left, row.top()), Pos2::new(right, row.bottom()));
-    for db in [-60.0f32, -48.0, -36.0, -24.0, -12.0, 0.0] {
-        let align = if db == 0.0 {
-            Align2::RIGHT_CENTER
-        } else if db == METER_FLOOR_DB {
-            Align2::LEFT_CENTER
-        } else {
-            Align2::CENTER_CENTER
-        };
-        ui.painter().text(
-            Pos2::new(x_for_db(span, db), row.center().y),
-            align,
-            format!("{db:.0}"),
-            theme::mono(10.0),
-            theme::INK_TERTIARY,
+/// What to draw in a [`waveform`] lane besides the samples.
+#[derive(Debug, Default)]
+pub struct WaveOverlay {
+    /// First column (0 = oldest) that belongs to the take being recorded.
+    pub recording_from: Option<usize>,
+    /// Columns of bar lines and of the lighter beat lines between them.
+    pub bars: Vec<usize>,
+    pub beats: Vec<usize>,
+    pub markers: Vec<usize>,
+}
+
+/// Scrolling waveform: one lane per channel, newest audio at the right edge.
+pub fn waveform(
+    ui: &mut Ui,
+    size: Vec2,
+    waves: &WaveHistory,
+    channels: &[usize],
+    blocks: usize,
+    overlay: &dyn Fn(usize) -> WaveOverlay,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(theme::RADIUS_XS), theme::SURFACE_2);
+    let columns = rect.width().floor().max(1.0) as usize;
+    let overlay = overlay(columns);
+    let x_of = |col: usize| rect.left() + col as f32 + 0.5;
+    let vline = |col: usize, color: Color32| {
+        painter.line_segment(
+            [
+                Pos2::new(x_of(col), rect.top()),
+                Pos2::new(x_of(col), rect.bottom()),
+            ],
+            Stroke::new(1.0, color),
+        );
+    };
+    for col in &overlay.beats {
+        vline(*col, theme::HAIRLINE);
+    }
+    for col in &overlay.bars {
+        vline(*col, theme::HAIRLINE_STRONG);
+    }
+
+    let lanes = channels.len().max(1) as f32;
+    let lane_height = rect.height() / lanes;
+    for (lane, channel) in channels.iter().enumerate() {
+        let mid = rect.top() + lane_height * (lane as f32 + 0.5);
+        let half = lane_height / 2.0 - 1.0;
+        painter.line_segment(
+            [Pos2::new(rect.left(), mid), Pos2::new(rect.right(), mid)],
+            Stroke::new(1.0, theme::HAIRLINE),
+        );
+        for (col, extent) in waves.columns(*channel, blocks, columns).iter().enumerate() {
+            let Some(extent) = extent else { continue };
+            let recorded = overlay.recording_from.is_some_and(|from| col >= from);
+            let clipped = extent.max >= CLIP_THRESHOLD || extent.min <= -CLIP_THRESHOLD;
+            let color = if clipped {
+                theme::WARN
+            } else if recorded {
+                theme::REC
+            } else {
+                theme::INK_TERTIARY
+            };
+            let top = mid - extent.max.clamp(-1.0, 1.0) * half;
+            let bottom = mid - extent.min.clamp(-1.0, 1.0) * half;
+            // Keep even silence visible as a thin trace.
+            let (top, bottom) = if bottom - top < 1.0 {
+                (mid - 0.5, mid + 0.5)
+            } else {
+                (top, bottom)
+            };
+            painter.line_segment(
+                [Pos2::new(x_of(col), top), Pos2::new(x_of(col), bottom)],
+                Stroke::new(1.0, color),
+            );
+        }
+    }
+    for col in &overlay.markers {
+        vline(*col, theme::INK);
+        painter.text(
+            Pos2::new(x_of(*col) + 2.0, rect.top() + 1.0),
+            Align2::LEFT_TOP,
+            icon::FLAG,
+            theme::icons(11.0),
+            theme::INK,
         );
     }
 }
@@ -500,4 +567,134 @@ pub fn usage_bar(ui: &mut Ui, fraction: f32) {
     let mut filled = rect;
     filled.set_width(rect.width() * fraction);
     painter.rect_filled(filled, CornerRadius::same(2), color);
+}
+
+/// Small square toggle (monitor / mute / solo). `tint` is its color when on.
+pub fn toggle_chip(ui: &mut Ui, label: &str, is_icon: bool, on: bool, tint: Color32) -> Response {
+    let sense = if ui.is_enabled() {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), sense);
+    let ctx = ui.ctx();
+    let on_t = theme::animate(ctx, response.id.with("on"), on, theme::DURATION_FAST);
+    let hover = theme::animate(
+        ctx,
+        response.id.with("hover"),
+        ui.is_enabled() && response.hovered(),
+        theme::DURATION_FAST,
+    );
+    let painter = ui.painter();
+    let idle_fill = theme::mix(theme::SURFACE_2, theme::SURFACE_4, hover);
+    painter.rect(
+        rect,
+        CornerRadius::same(theme::RADIUS_SM),
+        theme::mix(idle_fill, theme::mix(theme::SURFACE_1, tint, 0.28), on_t),
+        Stroke::new(1.0, theme::mix(theme::HAIRLINE, tint, on_t)),
+        StrokeKind::Inside,
+    );
+    let font = if is_icon {
+        theme::icons(14.0)
+    } else {
+        theme::medium(theme::TEXT_SMALL)
+    };
+    let idle_text = if ui.is_enabled() {
+        theme::INK_SUBTLE
+    } else {
+        theme::INK_TERTIARY.gamma_multiply(0.6)
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        font,
+        theme::mix(idle_text, tint, on_t),
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(theme::RADIUS_SM),
+            focus_stroke(),
+            StrokeKind::Inside,
+        );
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// On/off switch with a sliding knob. Returns true when it was flipped.
+pub fn switch(ui: &mut Ui, on: &mut bool) -> Response {
+    let sense = if ui.is_enabled() {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(34.0, 20.0), sense);
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let t = theme::animate(ui.ctx(), response.id.with("on"), *on, theme::DURATION_FAST);
+    let painter = ui.painter();
+    let radius = rect.height() / 2.0;
+    painter.rect(
+        rect,
+        radius,
+        theme::mix(theme::SURFACE_3, theme::ACCENT, t),
+        Stroke::new(
+            1.0,
+            theme::mix(theme::HAIRLINE_STRONG, theme::ACCENT_HOVER, t),
+        ),
+        StrokeKind::Inside,
+    );
+    let x = theme::lerp(rect.left() + radius, rect.right() - radius, t);
+    painter.circle_filled(
+        Pos2::new(x, rect.center().y),
+        radius - 3.0,
+        theme::mix(theme::INK_SUBTLE, theme::INK, t),
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.expand(2.0),
+            radius + 2.0,
+            focus_stroke(),
+            StrokeKind::Outside,
+        );
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// One dot per beat of the bar; the current beat lights up and fades until the next one.
+pub fn beat_lights(ui: &mut Ui, beats_per_bar: u32, current: Option<(u32, f32)>) {
+    let dot = 8.0;
+    let gap = 5.0;
+    let width = beats_per_bar as f32 * (dot + gap) - gap;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::hover());
+    for beat in 0..beats_per_bar {
+        let center = Pos2::new(
+            rect.left() + dot / 2.0 + beat as f32 * (dot + gap),
+            rect.center().y,
+        );
+        let glow = match current {
+            Some((b, phase)) if b == beat => {
+                if theme::reduced_motion() {
+                    1.0
+                } else {
+                    (1.0 - phase).powi(2)
+                }
+            }
+            _ => 0.0,
+        };
+        // The downbeat is marked by size, the running beat by brightness.
+        let radius = if beat == 0 {
+            dot / 2.0
+        } else {
+            dot / 2.0 - 1.0
+        };
+        ui.painter().circle_filled(
+            center,
+            radius + glow,
+            theme::mix(theme::SURFACE_4, theme::INK, glow),
+        );
+    }
 }
