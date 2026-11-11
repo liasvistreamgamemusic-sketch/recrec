@@ -1,6 +1,6 @@
 [package]
 name = "recrec"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Multichannel recorder for musicians: records every input of an audio interface to its own WAV file"
 license = "GPL-3.0-or-later"

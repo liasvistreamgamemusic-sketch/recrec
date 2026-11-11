@@ -94,6 +94,45 @@ pub(super) struct TakeEdit {
     pub confirm_delete: bool,
 }
 
+/// How much the live lanes show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiveWindow {
+    /// The most recent seconds of input.
+    Secs(u32),
+    /// The take being recorded, from its start (outside a take: the default window).
+    WholeTake,
+}
+
+impl LiveWindow {
+    pub const DEFAULT_SECS: u32 = 10;
+    const STEPS: [u32; 9] = [5, 10, 30, 60, 120, 300, 600, 1800, 3600];
+
+    fn step_index(self) -> Option<usize> {
+        match self {
+            Self::Secs(s) => Self::STEPS.iter().position(|step| *step >= s),
+            Self::WholeTake => None,
+        }
+    }
+
+    pub fn wider(self) -> Self {
+        match self.step_index() {
+            Some(i) if i + 1 < Self::STEPS.len() => Self::Secs(Self::STEPS[i + 1]),
+            Some(_) => Self::WholeTake,
+            None => Self::WholeTake,
+        }
+    }
+
+    pub fn narrower(self) -> Self {
+        match self.step_index() {
+            Some(i) => Self::Secs(Self::STEPS[i.saturating_sub(1)]),
+            None => Self::Secs(Self::STEPS[Self::STEPS.len() - 1]),
+        }
+    }
+}
+
+/// Input history kept while idle (during a take, the whole take is kept).
+const IDLE_HISTORY_SECONDS: u32 = 60;
+
 /// Progress of a re-recording from a point of the open take.
 #[derive(Debug, Clone, Copy)]
 enum Punch {
@@ -146,6 +185,7 @@ pub struct RecrecApp {
     /// Horizontal extent of the track lanes in the last frame (aligns the time ruler).
     pub(super) lane_span: Option<(f32, f32)>,
     punch: Option<Punch>,
+    pub(super) live_window: LiveWindow,
     pub(super) update: UpdateState,
     /// Events of the running update thread, if any.
     update_rx: Option<Receiver<UpdateEvent>>,
@@ -199,6 +239,7 @@ impl RecrecApp {
             open_take: None,
             lane_span: None,
             punch: None,
+            live_window: LiveWindow::Secs(LiveWindow::DEFAULT_SECS),
             update: UpdateState::Idle,
             update_rx: None,
             self_update_supported: crate::platform::is_installed_build()
@@ -602,6 +643,20 @@ impl RecrecApp {
         Some((pos.beat, (pos.offset / beat) as f32))
     }
 
+    /// Number of waveform blocks the live lanes show right now.
+    pub(super) fn live_window_blocks(&self) -> usize {
+        let per_sec = crate::waveform::BLOCKS_PER_SECOND;
+        let default = (LiveWindow::DEFAULT_SECS * per_sec) as usize;
+        match (self.live_window, self.rec_wave_start, &self.session) {
+            (LiveWindow::Secs(s), _, _) => (s * per_sec) as usize,
+            (LiveWindow::WholeTake, Some(start), Some(session)) => {
+                // Never narrower than the default, so a take that just began is not a blur.
+                (session.waves.total_blocks().saturating_sub(start) as usize).max(default)
+            }
+            (LiveWindow::WholeTake, _, _) => default,
+        }
+    }
+
     /// Whether the app can play sound at all (false: metronome and monitoring are disabled).
     pub(super) fn has_output(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.has_output())
@@ -1003,8 +1058,15 @@ impl RecrecApp {
         }
 
         self.sync_transport();
+        let recording = self.recording_dir.is_some();
+        let idle_blocks = self
+            .live_window_blocks()
+            .max((IDLE_HISTORY_SECONDS * crate::waveform::BLOCKS_PER_SECOND) as usize);
         if let Some(s) = &mut self.session {
             s.poll_waveform();
+            if !recording {
+                s.waves.trim(idle_blocks);
+            }
         }
 
         let dt = self.last_meter_time.map_or(0.0, |t| (now - t) as f32);
@@ -1352,5 +1414,27 @@ mod tests {
     fn bytes_format_in_mb_or_gb() {
         assert_eq!(format_bytes(500 * 1024 * 1024), "500 MB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+    }
+}
+
+#[cfg(test)]
+mod live_window_tests {
+    use super::LiveWindow;
+
+    #[test]
+    fn stepping_walks_the_scale_and_ends_at_the_whole_take() {
+        let mut w = LiveWindow::Secs(10);
+        w = w.wider();
+        assert_eq!(w, LiveWindow::Secs(30));
+        for _ in 0..10 {
+            w = w.wider();
+        }
+        assert_eq!(w, LiveWindow::WholeTake);
+        w = w.narrower();
+        assert_eq!(w, LiveWindow::Secs(3600));
+        for _ in 0..20 {
+            w = w.narrower();
+        }
+        assert_eq!(w, LiveWindow::Secs(5));
     }
 }

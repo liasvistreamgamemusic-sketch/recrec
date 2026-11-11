@@ -10,15 +10,17 @@ use eframe::egui::{
     Layout, Margin, Order, RichText, ScrollArea, Sense, Slider, Stroke, TextEdit, Ui, Vec2,
 };
 
-use super::app::{Level, Message, RecrecApp, UpdateState, format_bytes, format_duration};
+use super::app::{
+    Level, LiveWindow, Message, RecrecApp, UpdateState, format_bytes, format_duration,
+};
 use super::theme::{self, icon};
 use super::widgets::{
-    RECORD_BUTTON_SIZE, WaveOverlay, arm_toggle, badge, beat_lights, clip_badge, db_readout,
-    field_label, file_chip, icon_button, record_button, section_label, segmented, switch,
-    take_lane, time_ruler, toggle_chip, transport_button, usage_bar, vmeter, waveform,
+    BeatGrid, RECORD_BUTTON_SIZE, WaveOverlay, arm_toggle, badge, beat_lights, clip_badge,
+    db_readout, field_label, file_chip, icon_button, overview, record_button, section_label,
+    segmented, switch, take_lane, time_ruler, toggle_chip, transport_button, usage_bar, vmeter,
+    waveform,
 };
 use crate::meter::{METER_FLOOR_DB, MeterDisplay};
-use crate::metronome;
 use crate::platform;
 use crate::recorder::MAX_PREROLL_SECS;
 use crate::take::TakeEntry;
@@ -35,8 +37,6 @@ const TRACK_HEADER_WIDTH: f32 = 232.0;
 const TRACK_SOURCE_WIDTH: f32 = 112.0;
 const TRACK_LANE_HEIGHT: f32 = 54.0;
 const DB_READOUT_WIDTH: f32 = 46.0;
-/// The waveform lanes show the last 10 seconds.
-const WAVE_WINDOW_BLOCKS: usize = 10 * waveform::BLOCKS_PER_SECOND as usize;
 const EDIT_DIALOG_WIDTH: f32 = 380.0;
 /// Width of the clock and summary beside the record button.
 const CLOCK_COLUMN_WIDTH: f32 = 300.0;
@@ -654,7 +654,13 @@ impl RecrecApp {
                             (Some(c), _) => format!("-{} · {}", c.bars_left, c.beat),
                             (None, Some(Some(secs))) => format!("-{secs:.1}"),
                             (None, Some(None)) => "…".to_owned(),
-                            (None, None) => format_duration(self.elapsed_secs()),
+                            (None, None) => {
+                                // On the metronome, the clock can count bars and beats.
+                                match self.live_grid().filter(|_| self.config.ruler_bars) {
+                                    Some(grid) => grid.label(self.elapsed_secs()),
+                                    None => format_duration(self.elapsed_secs()),
+                                }
+                            }
                         };
                         ui.label(
                             RichText::new(clock)
@@ -913,12 +919,13 @@ impl RecrecApp {
         let lane_width = self.lane_span.map_or(400.0, |(l, r)| (r - l).max(1.0));
         let position = self.play_position();
         let playing = self.is_playing();
-        if busy {
-            self.lane_span = None;
-        } else if self.open_take.is_some() {
+        let take_mode = !busy && self.open_take.is_some();
+        if take_mode {
             self.take_toolbar(ui, lane_width);
+        } else {
+            self.live_toolbar(ui);
         }
-        let view = self.open_take.as_mut().filter(|_| !busy).map(|t| {
+        let view = self.open_take.as_mut().filter(|_| take_mode).map(|t| {
             let frames_per_px = t.zoom(lane_width);
             if playing {
                 t.follow(position, lane_width);
@@ -926,28 +933,50 @@ impl RecrecApp {
             t.clamp_view(lane_width);
             (t.view_start, frames_per_px)
         });
+        let take_grid = self.take_grid();
+        let bars = self.config.ruler_bars;
+        let mut take_grid_px: Vec<(f32, bool)> = Vec::new();
         if let (Some((view_start, frames_per_px)), Some((left, right)), Some(take)) =
             (view, self.lane_span, &self.open_take)
         {
             let rate = f64::from(take.meta.sample_rate.max(1));
-            let action = time_ruler(
+            let secs_per_px = frames_per_px / rate;
+            let seek_px = time_ruler(
                 ui,
-                left,
-                right,
+                (left, right),
                 view_start / rate,
-                frames_per_px / rate,
+                secs_per_px,
                 take.duration_secs(),
                 Some(((position as f64 - view_start) / frames_per_px) as f32),
+                take_grid.filter(|_| bars),
             );
-            if let Some(px) = action.seek_px {
-                let frame = self.open_take.as_mut().map(|t| t.frame_at(px, lane_width));
+            let window = overview(
+                ui,
+                (left, right),
+                &take.overview(lane_width.floor().max(1.0) as usize),
+                take.window(lane_width),
+                Some(position as f64 / take.frames.max(1) as f64),
+            );
+            if let Some(grid) = take_grid {
+                let from = view_start / rate;
+                take_grid_px = grid
+                    .lines(
+                        from,
+                        from + f64::from(lane_width) * secs_per_px,
+                        6.0 * secs_per_px,
+                    )
+                    .into_iter()
+                    .map(|(t, bar)| (((t - from) / secs_per_px) as f32, bar))
+                    .collect();
+            }
+            if let Some(px) = seek_px {
+                let frame = self.open_take.as_ref().map(|t| t.frame_at(px, lane_width));
                 if let Some(frame) = frame {
                     self.seek(frame);
                 }
             }
-            if let (Some(fraction), Some(t)) = (action.scroll_fraction, &mut self.open_take) {
-                t.view_start += f64::from(fraction) * t.frames as f64;
-                t.clamp_view(lane_width);
+            if let (Some((start, end)), Some(t)) = (window, &mut self.open_take) {
+                t.set_window(start, end, lane_width);
             }
         }
         let view = self.open_take.as_ref().zip(view);
@@ -956,12 +985,32 @@ impl RecrecApp {
         let mut scroll_px = 0.0f32;
         let mut span: Option<(f32, f32)> = None;
 
+        // Live lanes: the newest `window_blocks` blocks of the inputs, newest at the right.
+        let window_blocks = self.live_window_blocks();
+        let live_grid = self.live_grid();
+        let blocks_per_sec = f64::from(waveform::BLOCKS_PER_SECOND);
+        if !take_mode
+            && let (Some(start), Some((left, right)), Some(s)) =
+                (self.rec_wave_start, self.lane_span, &self.session)
+        {
+            // While recording, the ruler counts from the start of the take.
+            let total = s.waves.total_blocks();
+            time_ruler(
+                ui,
+                (left, right),
+                (total as f64 - window_blocks as f64 - start as f64) / blocks_per_sec,
+                window_blocks as f64 / blocks_per_sec / f64::from((right - left).max(1.0)),
+                total.saturating_sub(start) as f64 / blocks_per_sec,
+                None,
+                live_grid.filter(|_| bars),
+            );
+        }
+
         let fallback_names = track::fallback_names(channels);
         let names = self
             .session
             .as_ref()
             .map_or(&fallback_names, |s| &s.info.channel_names);
-        let grid = self.wave_grid();
         let waves = self.session.as_ref().map(|s| &s.waves);
         let rec_start = self.rec_wave_start;
         let markers = &self.marker_blocks;
@@ -972,31 +1021,29 @@ impl RecrecApp {
             let total = waves.total_blocks();
             // Column of a block inside the visible window (None when it scrolled out).
             let col_of = |block: u64| -> Option<usize> {
-                let from_left = (block + WAVE_WINDOW_BLOCKS as u64).checked_sub(total)?;
-                Some((from_left as usize * columns / WAVE_WINDOW_BLOCKS).min(columns - 1))
+                let from_left = (block + window_blocks as u64).checked_sub(total)?;
+                Some((from_left as usize * columns / window_blocks).min(columns - 1))
             };
             let mut o = WaveOverlay {
                 recording_from: rec_start.map(|s| col_of(s).unwrap_or(0)),
                 markers: markers.iter().filter_map(|b| col_of(*b)).collect(),
                 ..Default::default()
             };
-            if let (Some(start), Some((beat_blocks, beats_per_bar))) = (rec_start, grid) {
-                let first_visible = total.saturating_sub(WAVE_WINDOW_BLOCKS as u64);
-                let mut k =
-                    (first_visible.saturating_sub(start) as f64 / beat_blocks).ceil() as u64;
-                loop {
-                    let block = start + (k as f64 * beat_blocks).round() as u64;
-                    if block > total {
-                        break;
-                    }
+            if let (Some(start), Some(grid)) = (rec_start, live_grid) {
+                // Grid times are measured from the start of the take (bar 1).
+                let first_visible = total.saturating_sub(window_blocks as u64);
+                let from = (first_visible as f64 - start as f64) / blocks_per_sec;
+                let to = (total as f64 - start as f64) / blocks_per_sec;
+                let secs_per_column = window_blocks as f64 / blocks_per_sec / columns as f64;
+                for (t, bar) in grid.lines(from, to, 6.0 * secs_per_column) {
+                    let block = start + (t * blocks_per_sec).round() as u64;
                     if let Some(col) = col_of(block) {
-                        if k.is_multiple_of(u64::from(beats_per_bar)) {
+                        if bar {
                             o.bars.push(col);
                         } else {
                             o.beats.push(col);
                         }
                     }
-                    k += 1;
                 }
             }
             o
@@ -1090,7 +1137,7 @@ impl RecrecApp {
                                         let size = Vec2::new(width, TRACK_LANE_HEIGHT);
                                         let lane = match (view, waves) {
                                             (Some((take, (view_start, frames_per_px))), _) => {
-                                                let block = f64::from(take.peaks.block.max(1));
+                                                let block = f64::from(take.block);
                                                 let px_of = |frame: u64| {
                                                     ((frame as f64 - view_start) / frames_per_px)
                                                         as f32
@@ -1100,8 +1147,7 @@ impl RecrecApp {
                                                     .map(|t| take.lanes_of(t))
                                                     .unwrap_or(0..0)
                                                     .map(|l| {
-                                                        take.peaks.columns(
-                                                            l,
+                                                        take.lanes[l].columns(
                                                             view_start / block,
                                                             frames_per_px * f64::from(width)
                                                                 / block,
@@ -1121,6 +1167,7 @@ impl RecrecApp {
                                                     &lanes,
                                                     Some(px_of(position)),
                                                     &markers,
+                                                    &take_grid_px,
                                                     lanes.is_empty().then_some(
                                                         "このテイクには録音されていません",
                                                     ),
@@ -1152,7 +1199,7 @@ impl RecrecApp {
                                                 size,
                                                 waves,
                                                 &sources,
-                                                WAVE_WINDOW_BLOCKS,
+                                                window_blocks,
                                                 &overlay,
                                             ),
                                             (None, None) => ui.allocate_space(size).1,
@@ -1225,11 +1272,15 @@ impl RecrecApp {
         let playing = self.is_playing();
         let blocker = self.playback_blocker();
         let rate = f64::from(take.meta.sample_rate.max(1));
-        let clock = format!(
-            "{} / {}",
-            format_duration(self.play_position() as f64 / rate),
-            format_duration(take.duration_secs())
-        );
+        let now = self.play_position() as f64 / rate;
+        let clock = match self.take_grid().filter(|_| self.config.ruler_bars) {
+            Some(grid) => format!("{} / {}", grid.label(now), grid.label(take.duration_secs())),
+            None => format!(
+                "{} / {}",
+                format_duration(now),
+                format_duration(take.duration_secs())
+            ),
+        };
         let name = take.name.clone();
         let mut toggle = false;
         let mut rewind = false;
@@ -1282,6 +1333,8 @@ impl RecrecApp {
                                 "録り直したい位置を波形でクリックして選びます (再生中は使えません)",
                             )
                             .clicked();
+                        self.unit_toggle(ui);
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         if ui
                             .button("全体")
                             .on_hover_text("テイク全体が収まるように表示")
@@ -1348,18 +1401,89 @@ impl RecrecApp {
         }
     }
 
-    /// Beat length in waveform blocks and beats per bar, while a take runs on the metronome.
-    fn wave_grid(&self) -> Option<(f64, u32)> {
+    /// Tempo grid of the take being recorded (it starts on bar 1 when the metronome is on).
+    fn live_grid(&self) -> Option<BeatGrid> {
         let s = self.session.as_ref()?;
         let m = &self.config.metronome;
         if self.rec_wave_start.is_none() || !m.enabled || !s.has_output() {
             return None;
         }
-        let beat = metronome::beat_frames(s.info.sample_rate, m.bpm, m.beat_unit);
-        Some((
-            beat / waveform::block_frames(s.info.sample_rate) as f64,
-            m.beats_per_bar,
-        ))
+        Some(BeatGrid {
+            beat_secs: 60.0 / m.bpm * 4.0 / f64::from(m.beat_unit.max(1)),
+            beats_per_bar: m.beats_per_bar,
+        })
+    }
+
+    /// Tempo grid of the opened take, if it was recorded on the metronome.
+    fn take_grid(&self) -> Option<BeatGrid> {
+        let tempo = self.open_take.as_ref()?.meta.tempo?;
+        Some(BeatGrid {
+            beat_secs: 60.0 / tempo.bpm * 4.0 / f64::from(tempo.beat_unit.max(1)),
+            beats_per_bar: tempo.beats_per_bar,
+        })
+    }
+
+    /// Switch between minutes:seconds and bars.beats for the ruler and the clocks.
+    fn unit_toggle(&mut self, ui: &mut Ui) {
+        let mut bars = self.config.ruler_bars;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.selectable_value(&mut bars, true, "小節")
+            .on_hover_text("小節.拍で表示します (メトロノームを使って録ったテイクのみ)");
+        ui.selectable_value(&mut bars, false, "秒")
+            .on_hover_text("分:秒で表示します");
+        if bars != self.config.ruler_bars {
+            self.config.ruler_bars = bars;
+            self.mark_dirty();
+        }
+    }
+
+    /// Controls of the live lanes: how much of the recent input (or of the running take)
+    /// they show.
+    fn live_toolbar(&mut self, ui: &mut Ui) {
+        let recording = self.recording_dir.is_some();
+        let label = match self.live_window {
+            LiveWindow::WholeTake if recording => "テイク全体".to_owned(),
+            LiveWindow::WholeTake => format!("直近 {} 秒", LiveWindow::DEFAULT_SECS),
+            LiveWindow::Secs(s) if s >= 60 => format!("直近 {} 分", s / 60),
+            LiveWindow::Secs(s) => format!("直近 {s} 秒"),
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("表示範囲")
+                    .font(theme::regular(theme::TEXT_SMALL))
+                    .color(theme::INK_TERTIARY),
+            );
+            if ui
+                .small_button("−")
+                .on_hover_text("より長い範囲を表示")
+                .clicked()
+            {
+                self.live_window = self.live_window.wider();
+            }
+            if ui
+                .small_button("＋")
+                .on_hover_text("より短い範囲を表示")
+                .clicked()
+            {
+                self.live_window = self.live_window.narrower();
+            }
+            if ui
+                .add_enabled(recording, Button::new("全体").small())
+                .on_hover_text("録音中のテイクを最初から表示")
+                .on_disabled_hover_text("録音中に使えます")
+                .clicked()
+            {
+                self.live_window = LiveWindow::WholeTake;
+            }
+            ui.label(
+                RichText::new(label)
+                    .font(theme::mono(theme::TEXT_SMALL))
+                    .color(theme::INK_SUBTLE),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.unit_toggle(ui);
+            });
+        });
     }
 
     // ---- takes ---------------------------------------------------------------------------
