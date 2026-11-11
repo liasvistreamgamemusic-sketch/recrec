@@ -1328,7 +1328,7 @@ impl RecrecApp {
                 t.zoom_by(factor, lane_width / 2.0, lane_width);
             }
             if show_all {
-                t.show_all(lane_width);
+                t.show_all();
             }
         }
         if toggle {

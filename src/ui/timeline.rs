@@ -20,7 +20,7 @@ pub(super) struct OpenTake {
     pub frames: u64,
     /// Left edge of the view, in frames (may be fractional while scrolling).
     pub view_start: f64,
-    /// Zoom; `None` until the lane width is known, then "whole take".
+    /// Zoom; `None` shows the whole take, whatever the lane width is.
     pub frames_per_px: Option<f64>,
     /// Where playback starts (and where it stopped).
     pub playhead: u64,
@@ -97,23 +97,24 @@ impl OpenTake {
         (self.frames.max(1) as f64 / f64::from(width.max(1.0))).max(MIN_FRAMES_PER_PX)
     }
 
-    /// Current zoom for a lane `width` pixels wide (fits the whole take the first time).
-    pub fn zoom(&mut self, width: f32) -> f64 {
-        let fit = self.fit(width);
-        *self.frames_per_px.get_or_insert(fit)
+    /// Current zoom (frames per pixel) for a lane `width` pixels wide.
+    pub fn zoom(&self, width: f32) -> f64 {
+        self.frames_per_px.unwrap_or_else(|| self.fit(width))
     }
 
-    pub fn show_all(&mut self, width: f32) {
-        self.frames_per_px = Some(self.fit(width));
+    pub fn show_all(&mut self) {
+        self.frames_per_px = None;
         self.view_start = 0.0;
     }
 
     /// Zooms by `factor` (> 1 zooms in), keeping the frame under `anchor_px` in place.
     pub fn zoom_by(&mut self, factor: f64, anchor_px: f32, width: f32) {
         let old = self.zoom(width);
-        let new = (old / factor).clamp(MIN_FRAMES_PER_PX, self.fit(width));
+        let fit = self.fit(width);
+        let new = (old / factor).clamp(MIN_FRAMES_PER_PX, fit);
         let anchor_frame = self.view_start + f64::from(anchor_px) * old;
-        self.frames_per_px = Some(new);
+        // Fully zoomed out means "keep fitting the take", also when the window is resized.
+        self.frames_per_px = (new < fit).then_some(new);
         self.view_start = anchor_frame - f64::from(anchor_px) * new;
         self.clamp_view(width);
     }
@@ -140,7 +141,7 @@ impl OpenTake {
         }
     }
 
-    pub fn frame_at(&mut self, px: f32, width: f32) -> u64 {
+    pub fn frame_at(&self, px: f32, width: f32) -> u64 {
         let frame = self.view_start + f64::from(px) * self.zoom(width);
         frame.clamp(0.0, self.frames as f64) as u64
     }
@@ -205,7 +206,7 @@ mod tests {
 
     #[test]
     fn first_zoom_fits_the_whole_take() {
-        let mut t = take(480_000);
+        let t = take(480_000);
         assert_eq!(t.zoom(1000.0), 480.0);
         assert_eq!(t.frame_at(500.0, 1000.0), 240_000);
     }
@@ -213,13 +214,15 @@ mod tests {
     #[test]
     fn zooming_keeps_the_anchor_and_stays_in_bounds() {
         let mut t = take(480_000);
-        t.zoom(1000.0);
         t.zoom_by(2.0, 500.0, 1000.0);
         assert_eq!(t.frames_per_px, Some(240.0));
         assert_eq!(t.frame_at(500.0, 1000.0), 240_000);
         // Cannot zoom out past "whole take" or in past the limit.
         t.zoom_by(0.01, 0.0, 1000.0);
-        assert_eq!(t.frames_per_px, Some(480.0));
+        assert_eq!(t.frames_per_px, None);
+        assert_eq!(t.zoom(1000.0), 480.0);
+        // "Whole take" follows the lane width.
+        assert_eq!(t.zoom(500.0), 960.0);
         assert_eq!(t.view_start, 0.0);
         t.zoom_by(1e9, 0.0, 1000.0);
         assert_eq!(t.frames_per_px, Some(MIN_FRAMES_PER_PX));
@@ -228,7 +231,6 @@ mod tests {
     #[test]
     fn scrolling_and_following_stay_inside_the_take() {
         let mut t = take(480_000);
-        t.zoom(1000.0);
         t.zoom_by(4.0, 0.0, 1000.0); // 120 frames per px: the view spans 120 000 frames
         t.scroll_by(-50.0, 1000.0);
         assert_eq!(t.view_start, 0.0);

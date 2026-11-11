@@ -1746,13 +1746,7 @@ mod tests {
         let meta = take::read_meta(&dir).unwrap();
         assert_eq!(meta.frames, 110);
         assert_eq!(meta.markers, vec![60]); // the old marker at 100 lies after the join
-        assert!(
-            dir.ends_with(take::take_dir_name(
-                chrono::NaiveDateTime::parse_from_str(&meta.started_at, "%Y-%m-%dT%H:%M:%S%.3f")
-                    .unwrap(),
-                "redo"
-            )) || dir.to_string_lossy().contains("redo")
-        );
+        assert!(dir.to_string_lossy().ends_with("_redo"));
         assert_eq!(TakePeaks::load(&dir).unwrap().lanes[0].len(), 22);
     }
 
