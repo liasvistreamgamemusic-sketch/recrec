@@ -15,11 +15,13 @@ use crate::config::{self, AppConfig};
 use crate::meter::MeterDisplay;
 use crate::metronome::{self, TapTempo};
 use crate::platform::SleepGuard;
-use crate::recorder::{RecorderEvent, TakeRequest, TrackRequest};
+use crate::recorder::{PunchRequest, RecorderEvent, TakeRequest, TrackRequest};
 use crate::take::{self, TakeEntry, Tempo};
 use crate::track::{self, Track};
 use crate::transport::{MAX_BPM, MIN_BPM};
 use crate::update::{self, Release, UpdateError};
+
+use super::timeline::OpenTake;
 
 const CONFIG_SAVE_DELAY: Duration = Duration::from_secs(1);
 const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(2);
@@ -92,6 +94,18 @@ pub(super) struct TakeEdit {
     pub confirm_delete: bool,
 }
 
+/// Progress of a re-recording from a point of the open take.
+#[derive(Debug, Clone, Copy)]
+enum Punch {
+    /// The writer thread is copying the part of the take that is kept.
+    Preparing,
+    /// The lead-in is playing; recording starts at this output frame.
+    Rolling { record_at_out: u64 },
+}
+
+/// Seconds of the old take played before a re-recording starts.
+const PUNCH_LEAD_IN_SECONDS: f64 = 4.0;
+
 /// Lead time between pressing record and the first beat, so the click starts cleanly.
 const START_LEAD_SECONDS: f64 = 0.05;
 
@@ -127,6 +141,11 @@ pub struct RecrecApp {
     /// Waveform blocks of the markers dropped in the current take.
     pub(super) marker_blocks: Vec<u64>,
     pub(super) take_edit: Option<TakeEdit>,
+    /// The take shown on the timeline for listening back (none: live input view).
+    pub(super) open_take: Option<OpenTake>,
+    /// Horizontal extent of the track lanes in the last frame (aligns the time ruler).
+    pub(super) lane_span: Option<(f32, f32)>,
+    punch: Option<Punch>,
     pub(super) update: UpdateState,
     /// Events of the running update thread, if any.
     update_rx: Option<Receiver<UpdateEvent>>,
@@ -177,6 +196,9 @@ impl RecrecApp {
             rec_wave_start: None,
             marker_blocks: Vec::new(),
             take_edit: None,
+            open_take: None,
+            lane_span: None,
+            punch: None,
             update: UpdateState::Idle,
             update_rx: None,
             self_update_supported: crate::platform::is_installed_build()
@@ -314,6 +336,9 @@ impl RecrecApp {
         match InputSession::open(self.host, &info.name, rate, buffer) {
             Ok(session) => {
                 session.recorder().set_preroll(self.config.preroll_secs);
+                if let Some(take) = &self.open_take {
+                    session.player.load(take.files.clone());
+                }
                 // Bar 1 starts when the stream does; a counted-in take moves it.
                 session.transport.set_origin_out(0);
                 if let Some(e) = &session.output_error {
@@ -503,6 +528,7 @@ impl RecrecApp {
             skip_silent: self.config.skip_silent_tracks,
         };
         self.dropped_at_take_start = session.dropped_frames();
+        session.player.stop();
         session.recorder().start(request);
         self.start_pending = true;
         self.count_in = count_in;
@@ -612,6 +638,200 @@ impl RecrecApp {
         t.set_click(click, m.volume.clamp(0.0, 1.0));
         t.set_master_gain(self.config.output_volume.clamp(0.0, 1.0));
         t.set_channel_gains(&track::monitor_gains(&self.tracks, t.in_channels()));
+        if let Some(take) = &self.open_take {
+            let any_solo = self.tracks.iter().any(|t| t.solo);
+            let gains: Vec<(f32, f32)> = take
+                .meta
+                .tracks
+                .iter()
+                .map(|t| {
+                    let channels: Vec<usize> = t
+                        .inputs
+                        .iter()
+                        .map(|c| usize::from(*c).saturating_sub(1))
+                        .collect();
+                    let row = self.tracks.iter().find(|r| r.source.channels() == channels);
+                    track::playback_gain(row, any_solo)
+                })
+                .collect();
+            s.player.set_gains(&gains);
+        }
+    }
+
+    // ---- listening back ------------------------------------------------------------------
+
+    /// Opens a take on the timeline. Not possible while recording.
+    pub(super) fn open_take(&mut self, dir: &std::path::Path) {
+        if self.is_busy() {
+            return;
+        }
+        match OpenTake::load(dir) {
+            Ok(take) => {
+                if let Some(s) = &self.session {
+                    s.player.load(take.files.clone());
+                }
+                self.open_take = Some(take);
+            }
+            Err(e) => self.push(Level::Error, e),
+        }
+    }
+
+    /// Back to the live input view.
+    pub(super) fn close_take(&mut self) {
+        if self.open_take.take().is_some()
+            && let Some(s) = &self.session
+        {
+            s.player.stop();
+        }
+    }
+
+    pub(super) fn is_playing(&self) -> bool {
+        self.open_take.is_some() && self.session.as_ref().is_some_and(|s| s.player.is_playing())
+    }
+
+    /// Why the open take cannot be played, if it cannot.
+    pub(super) fn playback_blocker(&self) -> Option<String> {
+        let take = self.open_take.as_ref()?;
+        let s = self.session.as_ref()?;
+        if !s.has_output() {
+            return Some("音を出せないため再生できません".into());
+        }
+        (take.meta.sample_rate != s.info.sample_rate).then(|| {
+            format!(
+                "このテイクは {} Hz です。今のサンプルレート ({} Hz) では再生できません",
+                take.meta.sample_rate, s.info.sample_rate
+            )
+        })
+    }
+
+    /// Take frame under the playhead (the one being heard while playing).
+    pub(super) fn play_position(&self) -> u64 {
+        match (&self.open_take, &self.session) {
+            (Some(take), Some(s)) if s.player.is_playing() => s.player.position().min(take.frames),
+            (Some(take), _) => take.playhead,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn toggle_play(&mut self) {
+        if self.is_busy() || self.playback_blocker().is_some() {
+            return;
+        }
+        let (Some(take), Some(s)) = (&mut self.open_take, &self.session) else {
+            return;
+        };
+        if s.player.is_playing() {
+            take.playhead = s.player.position().min(take.frames);
+            s.player.stop();
+        } else {
+            // From the end, play starts over.
+            if take.playhead >= take.frames {
+                take.playhead = 0;
+            }
+            s.player.play(take.playhead, None, 0);
+        }
+    }
+
+    /// Moves the playhead; playback continues from there if it was running.
+    pub(super) fn seek(&mut self, frame: u64) {
+        let (Some(take), Some(s)) = (&mut self.open_take, &self.session) else {
+            return;
+        };
+        take.playhead = frame.min(take.frames);
+        if s.player.is_playing() {
+            s.player.play(take.playhead, None, 0);
+        }
+    }
+
+    /// Continues the open take: new audio is added at its end.
+    pub(super) fn append_to_open_take(&mut self) {
+        if self.is_busy() || !self.can_record() {
+            return;
+        }
+        let (Some(take), Some(session)) = (&self.open_take, &self.session) else {
+            return;
+        };
+        session.player.stop();
+        self.dropped_at_take_start = session.dropped_frames();
+        session.recorder().append(take.dir.clone());
+        self.start_pending = true;
+    }
+
+    /// Re-records from the playhead: the open take stays as it is, and a new take is made
+    /// from its beginning up to the playhead plus what is recorded now.
+    pub(super) fn start_punch(&mut self) {
+        if self.is_busy() || !self.can_record() || self.playback_blocker().is_some() {
+            return;
+        }
+        let (Some(take), Some(session)) = (&self.open_take, &self.session) else {
+            return;
+        };
+        if take.playhead == 0 {
+            return;
+        }
+        session.player.stop();
+        self.dropped_at_take_start = session.dropped_frames();
+        session.recorder().prepare_punch(PunchRequest {
+            source: take.dir.clone(),
+            at_frame: take.playhead,
+            root: self.config.output_dir(),
+            label: take::label_of(&take.name).to_owned(),
+        });
+        self.start_pending = true;
+        self.punch = Some(Punch::Preparing);
+    }
+
+    /// The kept part is written: play the lead-in and schedule the recording at its end.
+    fn roll_punch(&mut self, at_frame: u64) {
+        let Some(session) = &self.session else { return };
+        let rate = f64::from(session.info.sample_rate);
+        let lead = (rate * START_LEAD_SECONDS) as u64;
+        let lead_in = at_frame.min((rate * PUNCH_LEAD_IN_SECONDS) as u64);
+        let comp = (f64::from(self.config.latency_comp_ms) / 1000.0 * rate).round() as i64;
+        let t = &session.transport;
+        let gate_out = t.out_frames() + lead;
+        session
+            .player
+            .play(at_frame - lead_in, Some(at_frame), gate_out);
+        session
+            .recorder()
+            .start_punch((t.in_frames() + lead + lead_in).saturating_add_signed(comp));
+        self.punch = Some(Punch::Rolling {
+            record_at_out: gate_out + lead_in,
+        });
+    }
+
+    /// While a re-recording is being set up: seconds until recording starts (`None` while
+    /// the kept part is still being copied).
+    pub(super) fn punch_countdown(&self) -> Option<Option<f64>> {
+        let s = self.session.as_ref()?;
+        Some(match self.punch? {
+            Punch::Preparing => None,
+            Punch::Rolling { record_at_out } => Some(
+                record_at_out.saturating_sub(s.transport.out_frames()) as f64
+                    / f64::from(s.info.sample_rate),
+            ),
+        })
+    }
+
+    pub(super) fn is_paused(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.recorder().is_paused())
+    }
+
+    /// Pauses or resumes the take being recorded (it stays one take).
+    pub(super) fn toggle_pause(&mut self) {
+        if self.recording_dir.is_none() {
+            return;
+        }
+        if let Some(s) = &self.session {
+            if s.recorder().is_paused() {
+                s.recorder().resume();
+            } else {
+                s.recorder().pause();
+            }
+        }
     }
 
     pub(super) fn begin_take_edit(&mut self, take: &TakeEntry) {
@@ -669,13 +889,21 @@ impl RecrecApp {
             RecorderEvent::Cancelled => {
                 self.start_pending = false;
                 self.count_in = None;
-                self.push(Level::Info, "カウントインを中止しました");
+                self.punch = None;
+                if let Some(s) = &self.session {
+                    s.player.stop();
+                }
+                self.push(Level::Info, "録音の開始を中止しました");
             }
+            RecorderEvent::PunchReady { at_frame, .. } => self.roll_punch(at_frame),
             RecorderEvent::Started { dir } => {
                 self.start_pending = false;
                 self.count_in = None;
                 self.rec_wave_start = self.session.as_ref().map(|s| s.waves.total_blocks());
                 self.marker_blocks.clear();
+                self.punch = None;
+                // While recording, the lanes show the live input.
+                self.close_take();
                 self.sleep_guard = Some(SleepGuard::new());
                 self.push(Level::Info, format!("録音開始: {}", dir.display()));
                 self.recording_dir = Some(dir);
@@ -720,8 +948,11 @@ impl RecrecApp {
                     self.push(Level::Error, e);
                 }
                 self.refresh_takes();
+                // Show what was just recorded, ready to be played back.
+                self.open_take(&summary.dir);
             }
             RecorderEvent::Error(msg) => {
+                self.punch = None;
                 self.start_pending = false;
                 self.count_in = None;
                 self.push(Level::Error, msg);
