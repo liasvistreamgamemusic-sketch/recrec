@@ -37,6 +37,7 @@ const DB_READOUT_WIDTH: f32 = 46.0;
 /// The waveform lanes show the last 10 seconds.
 const WAVE_WINDOW_BLOCKS: usize = 10 * waveform::BLOCKS_PER_SECOND as usize;
 const EDIT_DIALOG_WIDTH: f32 = 380.0;
+const SCROLL_BAR_GUTTER: f32 = 10.0;
 const MAX_TOASTS: usize = 3;
 const TOAST_WIDTH: f32 = 380.0;
 
@@ -214,6 +215,8 @@ impl RecrecApp {
     }
 
     fn sidebar_sections(&mut self, ui: &mut Ui, busy: bool) {
+        // Leave room for the scroll bar so it never covers the right-aligned values.
+        ui.set_width(ui.available_width() - SCROLL_BAR_GUTTER);
         section_label(ui, "オーディオ");
         ui.add_space(theme::SPACE_XXS);
         ui.add_enabled_ui(!busy, |ui| self.device_fields(ui));
