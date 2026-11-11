@@ -3,6 +3,7 @@ pub mod config;
 pub mod dither;
 pub mod meter;
 pub mod metronome;
+pub mod peaks;
 pub mod platform;
 pub mod recorder;
 pub mod take;

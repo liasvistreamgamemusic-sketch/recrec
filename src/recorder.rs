@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use chrono::{Local, NaiveDateTime, TimeDelta};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 
+use crate::peaks::{LaneBuilder, TakePeaks};
 use crate::take::{self, TakeMeta, Tempo, TrackMeta};
 use crate::wav::{Bext, SampleFormat, WavSpec, WavWriter};
+use crate::waveform::block_frames;
 
 pub const MAX_PREROLL_SECS: u32 = 30;
 /// A track whose peak never reaches this level (-60 dBFS) counts as silent: far below any
@@ -93,7 +95,11 @@ pub enum RecorderEvent {
 
 enum Command {
     Start(TakeRequest),
+    /// Continue an existing take: new audio is added to the end of its files.
+    Append(PathBuf),
     Stop,
+    Pause,
+    Resume,
     Marker,
     SetPreRoll(u32),
     Shutdown,
@@ -101,6 +107,7 @@ enum Command {
 
 #[derive(Debug, Default)]
 struct Shared {
+    paused: AtomicBool,
     recording: AtomicBool,
     frames: AtomicU64,
 }
@@ -152,6 +159,24 @@ impl Recorder {
 
     pub fn stop(&self) {
         self.send(Command::Stop);
+    }
+
+    /// Continues the take in `dir` from its end.
+    pub fn append(&self, dir: PathBuf) {
+        self.send(Command::Append(dir));
+    }
+
+    /// Stops writing but keeps the files open; [`Self::resume`] continues the same take.
+    pub fn pause(&self) {
+        self.send(Command::Pause);
+    }
+
+    pub fn resume(&self) {
+        self.send(Command::Resume);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Relaxed)
     }
 
     /// Drops a marker at the current position of the active take.
@@ -240,10 +265,15 @@ struct OpenTrack {
     buf: Vec<f32>,
     /// Highest absolute sample written so far.
     peak: f32,
+    /// Waveform overview of each channel of the file.
+    lanes: Vec<LaneBuilder>,
 }
 
 struct ActiveTake {
     skip_silent: bool,
+    paused: bool,
+    /// False when the stored overview could not be continued (it is then rebuilt on open).
+    peaks_valid: bool,
     dir: PathBuf,
     tracks: Vec<OpenTrack>,
     meta: TakeMeta,
@@ -322,6 +352,16 @@ impl Worker {
                     self.start_or_report(request, true);
                 }
             }
+            Command::Append(dir) => {
+                if self.take.is_some() || self.pending.is_some() {
+                    log::warn!("append requested while already recording; ignored");
+                } else if let Err(msg) = self.append(&dir) {
+                    log::error!("could not continue take: {msg}");
+                    self.emit(RecorderEvent::Error(msg));
+                }
+            }
+            Command::Pause => self.set_paused(true),
+            Command::Resume => self.set_paused(false),
             Command::Stop => {
                 self.cancel_pending();
                 self.drain();
@@ -354,6 +394,135 @@ impl Worker {
         if self.events.send(event).is_err() {
             log::warn!("UI is gone; recorder event dropped");
         }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        let Some(take) = self.take.as_mut() else {
+            return;
+        };
+        if take.paused == paused {
+            return;
+        }
+        if paused {
+            // Write what was captured up to the moment of the pause.
+            self.drain();
+        }
+        let Some(take) = self.take.as_mut() else {
+            return;
+        };
+        take.paused = paused;
+        self.shared.paused.store(paused, Ordering::Relaxed);
+        if !paused {
+            // Mark the join so it is easy to find in a DAW.
+            let at = take.tracks.first().map_or(0, |t| t.writer.frames_written());
+            if at > 0 && take.markers.last() != Some(&at) {
+                take.markers.push(at);
+            }
+        }
+    }
+
+    /// Reopens the files of a finished take so recording continues at its end.
+    fn append(&mut self, dir: &Path) -> Result<(), String> {
+        let meta = take::read_meta(dir).map_err(|e| format!("take.json を読めません: {e}"))?;
+        if meta.sample_rate != self.config.sample_rate {
+            return Err(format!(
+                "このテイクは {} Hz で録音されています。今のサンプルレート ({} Hz) では続きを録れません",
+                meta.sample_rate, self.config.sample_rate
+            ));
+        }
+        if meta.tracks.is_empty() {
+            return Err("このテイクにはトラックがありません".into());
+        }
+        check_free_space(dir, self.config.min_free_bytes)?;
+
+        let open = |keep: Option<u64>| -> Result<Vec<OpenTrack>, String> {
+            meta.tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let channels: Vec<usize> = t
+                        .inputs
+                        .iter()
+                        .map(|c| usize::from(*c).saturating_sub(1))
+                        .collect();
+                    if let Some(bad) = channels.iter().find(|c| **c >= self.config.channels) {
+                        return Err(format!("入力 {} はこのデバイスにありません", bad + 1));
+                    }
+                    let path = dir.join(&t.file);
+                    let spec = WavSpec {
+                        channels: channels.len() as u16,
+                        sample_rate: meta.sample_rate,
+                        format: meta.format,
+                    };
+                    let writer = WavWriter::open_append(&path, spec, keep, i as u32)
+                        .map_err(|e| format!("{} を開けません: {e}", path.display()))?;
+                    Ok(OpenTrack {
+                        writer,
+                        channels,
+                        path,
+                        buf: Vec::new(),
+                        // Whatever is already in the file counts as "not silent".
+                        peak: 1.0,
+                        lanes: Vec::new(),
+                    })
+                })
+                .collect()
+        };
+        let mut tracks = open(None)?;
+        let frames = tracks
+            .iter()
+            .map(|t| t.writer.frames_written())
+            .min()
+            .unwrap_or(0);
+        if tracks.iter().any(|t| t.writer.frames_written() != frames) {
+            // Files of unequal length (e.g. after a crash): continue from the shortest.
+            drop(tracks);
+            tracks = open(Some(frames))?;
+        }
+
+        // Continue the stored overview when it matches; otherwise it is rebuilt on open.
+        let block = block_frames(meta.sample_rate);
+        let stored = TakePeaks::load(dir)
+            .ok()
+            .filter(|p| p.block as usize == block)
+            .map(|p| p.lanes)
+            .filter(|lanes| lanes.len() == tracks.iter().map(|t| t.channels.len()).sum::<usize>());
+        let peaks_valid = stored.is_some();
+        let mut stored = stored.unwrap_or_default().into_iter();
+        for t in &mut tracks {
+            t.lanes = (0..t.channels.len())
+                .map(|_| LaneBuilder::resume(block, stored.next().unwrap_or_default(), frames))
+                .collect();
+        }
+
+        take::create_marker(dir).map_err(|e| format!("テイクフォルダに書き込めません: {e}"))?;
+        let mut markers = meta.markers.clone();
+        if frames > 0 && markers.last() != Some(&frames) {
+            markers.push(frames);
+        }
+        let now = Instant::now();
+        self.preroll.take();
+        self.take = Some(ActiveTake {
+            skip_silent: false,
+            paused: false,
+            peaks_valid,
+            dir: dir.to_owned(),
+            tracks,
+            meta,
+            markers,
+            dropped_at_start: self.dropped_frames.load(Ordering::Relaxed),
+            last_header: now,
+            last_sync: now,
+            last_disk_check: now,
+        });
+        self.shared.frames.store(frames, Ordering::Relaxed);
+        self.shared.paused.store(false, Ordering::Relaxed);
+        self.shared.recording.store(true, Ordering::Relaxed);
+        log::info!("take continued: {} (from frame {frames})", dir.display());
+        self.emit(RecorderEvent::Started {
+            dir: dir.to_owned(),
+        });
+        Ok(())
     }
 
     fn cancel_pending(&mut self) {
@@ -418,8 +587,11 @@ impl Worker {
         };
 
         let now = Instant::now();
+        self.shared.paused.store(false, Ordering::Relaxed);
         self.take = Some(ActiveTake {
             skip_silent,
+            paused: false,
+            peaks_valid: true,
             dir: dir.clone(),
             tracks,
             meta,
@@ -471,6 +643,10 @@ impl Worker {
                 path,
                 buf: Vec::new(),
                 peak: 0.0,
+                lanes: vec![
+                    LaneBuilder::new(block_frames(self.config.sample_rate));
+                    t.channels.len()
+                ],
             });
         }
 
@@ -527,8 +703,10 @@ impl Worker {
             let skip = at.saturating_sub(before) as usize * channels;
             self.start_or_report(request, false);
             self.write(&samples[skip.min(samples.len())..]);
-        } else if self.take.is_some() {
-            self.write(&samples);
+        } else if let Some(take) = &self.take {
+            if !take.paused {
+                self.write(&samples);
+            }
         } else {
             self.preroll.push(&samples);
         }
@@ -548,6 +726,11 @@ impl Worker {
                 track.buf.extend(track.channels.iter().map(|&c| frame[c]));
             }
             track.peak = track.buf.iter().fold(track.peak, |p, s| p.max(s.abs()));
+            for frame in track.buf.chunks_exact(track.lanes.len()) {
+                for (lane, s) in track.lanes.iter_mut().zip(frame) {
+                    lane.push(*s);
+                }
+            }
             if let Err(e) = track.writer.write_samples(&track.buf) {
                 failure = Some(format!(
                     "{} への書き込みに失敗しました: {e}",
@@ -608,6 +791,7 @@ impl Worker {
             return;
         };
         self.shared.recording.store(false, Ordering::Relaxed);
+        self.shared.paused.store(false, Ordering::Relaxed);
         let mut errors: Vec<String> = failure.iter().cloned().collect();
         let frames = take.tracks.first().map_or(0, |t| t.writer.frames_written());
         let mut files = Vec::with_capacity(take.tracks.len());
@@ -636,6 +820,7 @@ impl Worker {
                 match std::fs::remove_file(&files[i]) {
                     Ok(()) => {
                         files.remove(i);
+                        take.tracks.remove(i);
                         skipped_silent.insert(0, take.meta.tracks.remove(i).name);
                     }
                     Err(e) => errors.push(format!(
@@ -645,7 +830,29 @@ impl Worker {
                 }
             }
         }
-        take.meta.skipped_silent = skipped_silent.clone();
+        let peaks_path = take.dir.join(crate::peaks::PEAKS_FILE);
+        if take.peaks_valid {
+            let peaks = TakePeaks {
+                block: block_frames(self.config.sample_rate) as u32,
+                lanes: take
+                    .tracks
+                    .drain(..)
+                    .flat_map(|t| t.lanes)
+                    .map(LaneBuilder::finish)
+                    .collect(),
+            };
+            // The overview only speeds up opening the take; it is rebuilt when missing.
+            if let Err(e) = peaks.save(&take.dir) {
+                log::warn!("could not save waveform overview: {e}");
+            }
+        } else if peaks_path.exists()
+            && let Err(e) = std::fs::remove_file(&peaks_path)
+        {
+            log::warn!("could not remove stale waveform overview: {e}");
+        }
+        if !skipped_silent.is_empty() {
+            take.meta.skipped_silent = skipped_silent.clone();
+        }
         take.meta.frames = frames;
         take.meta.markers = std::mem::take(&mut take.markers);
         take.meta.dropped_frames = dropped;
@@ -1102,6 +1309,113 @@ mod tests {
         assert_eq!(summary.files.len(), 3);
         assert!(summary.skipped_silent.is_empty());
         assert!(dir.join("01_A.wav").exists());
+    }
+
+    fn one_track(root: &Path) -> TakeRequest {
+        request(
+            root,
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        )
+    }
+
+    #[test]
+    fn pausing_skips_audio_and_resuming_continues_the_same_file() {
+        let mut rig = rig();
+        rig.recorder.start(one_track(rig.root.path()));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 100);
+        wait_until(|| rig.recorder.frames_recorded() == 100);
+        rig.recorder.pause();
+        wait_until(|| rig.recorder.is_paused());
+        feed(&mut rig.producer, 100, 300);
+        wait_until(|| rig.producer.slots() == CH * 10_000);
+        rig.recorder.resume();
+        wait_until(|| !rig.recorder.is_paused());
+        feed(&mut rig.producer, 400, 50);
+        wait_until(|| rig.recorder.frames_recorded() == 150);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+
+        let expected: Vec<f32> = (0..100).chain(400..450).map(|n| sample(n, 0)).collect();
+        assert_eq!(read_float_wav(&dir.join("01_A.wav")), expected);
+        // The join is marked.
+        assert_eq!(take::read_meta(&dir).unwrap().markers, vec![100]);
+    }
+
+    #[test]
+    fn stopping_saves_a_waveform_overview() {
+        let mut rig = rig();
+        rig.recorder.start(one_track(rig.root.path()));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 23);
+        wait_until(|| rig.recorder.frames_recorded() == 23);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+        // RATE 1000 gives 5-frame blocks: 23 frames make 5 blocks.
+        let peaks = TakePeaks::load(&dir).unwrap();
+        assert_eq!(peaks.block, 5);
+        assert_eq!(peaks.lanes.len(), 1);
+        assert_eq!(peaks.lanes[0].len(), 5);
+    }
+
+    #[test]
+    fn appending_continues_a_finished_take() {
+        let mut rig = rig();
+        rig.recorder.start(one_track(rig.root.path()));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 23);
+        wait_until(|| rig.recorder.frames_recorded() == 23);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+
+        rig.recorder.append(dir.clone());
+        assert_eq!(
+            wait_event(&rig.recorder),
+            RecorderEvent::Started { dir: dir.clone() }
+        );
+        assert!(dir.join(take::MARKER_FILE).exists());
+        feed(&mut rig.producer, 500, 30);
+        wait_until(|| rig.recorder.frames_recorded() == 53);
+        rig.recorder.stop();
+        let summary = stopped(&rig.recorder);
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(summary.frames, 53);
+
+        let expected: Vec<f32> = (0..23).chain(500..530).map(|n| sample(n, 0)).collect();
+        assert_eq!(read_float_wav(&dir.join("01_A.wav")), expected);
+        let meta = take::read_meta(&dir).unwrap();
+        assert_eq!(meta.frames, 53);
+        assert_eq!(meta.markers, vec![23]);
+        assert!(!dir.join(take::MARKER_FILE).exists());
+        // The overview covers the whole take: ceil(53 / 5) blocks.
+        assert_eq!(TakePeaks::load(&dir).unwrap().lanes[0].len(), 11);
+    }
+
+    #[test]
+    fn appending_refuses_a_take_with_another_sample_rate() {
+        let mut rig = rig();
+        rig.recorder.start(one_track(rig.root.path()));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 10);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+        let mut meta = take::read_meta(&dir).unwrap();
+        meta.sample_rate = 44_100;
+        take::write_meta(&dir, &meta).unwrap();
+        rig.recorder.append(dir);
+        assert!(matches!(wait_event(&rig.recorder), RecorderEvent::Error(_)));
+        assert!(!rig.recorder.is_recording());
     }
 
     #[test]

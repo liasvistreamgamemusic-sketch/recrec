@@ -157,6 +157,43 @@ impl WavWriter {
         })
     }
 
+    /// Reopens a finished file to add audio after frame `keep_frames` (anything after it,
+    /// such as later audio or cue points, is cut off). `spec` must match the file.
+    pub fn open_append(
+        path: &Path,
+        spec: WavSpec,
+        keep_frames: Option<u64>,
+        dither_seed: u32,
+    ) -> io::Result<Self> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let scanned = scan(&mut file)?;
+        if scanned.spec()? != spec {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file format differs from the current recording settings",
+            ));
+        }
+        let block = u64::from(spec.block_align());
+        let existing = scanned.data_bytes(&mut file)?;
+        let data_bytes = keep_frames.map_or(existing, |f| (f * block).min(existing));
+        file.set_len(scanned.layout.data_start + data_bytes)?;
+        file.seek(SeekFrom::End(0))?;
+        let dither = (0..u32::from(spec.channels))
+            .map(|ch| Tpdf::new(dither_seed.wrapping_mul(64).wrapping_add(ch)))
+            .collect();
+        Ok(Self {
+            out: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+            spec,
+            layout: scanned.layout,
+            data_bytes,
+            rf64: scanned.rf64,
+            rf64_threshold: u64::from(u32::MAX),
+            dither,
+            encode_buf: Vec::new(),
+            finalized: false,
+        })
+    }
+
     pub fn spec(&self) -> WavSpec {
         self.spec
     }
@@ -443,6 +480,120 @@ struct Scanned {
     layout: Layout,
 }
 
+impl Scanned {
+    fn spec(&self) -> io::Result<WavSpec> {
+        let format = match (self.format_tag, self.bits) {
+            (FORMAT_TAG_PCM, 16) => SampleFormat::Pcm16,
+            (FORMAT_TAG_PCM, 24) => SampleFormat::Pcm24,
+            (FORMAT_TAG_IEEE_FLOAT, 32) => SampleFormat::Float32,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported format tag {} with {} bits",
+                        self.format_tag, self.bits
+                    ),
+                ));
+            }
+        };
+        Ok(WavSpec {
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            format,
+        })
+    }
+
+    /// Bytes of audio the header declares, capped by what the file actually holds.
+    fn data_bytes(&self, file: &mut File) -> io::Result<u64> {
+        let declared = if self.rf64 {
+            // ds64 body: riff size (8), then data size (8).
+            let mut b = [0u8; 8];
+            file.seek(SeekFrom::Start(RIFF_HEADER_LEN + 8 + 8))?;
+            file.read_exact(&mut b)?;
+            u64::from_le_bytes(b)
+        } else {
+            let mut b = [0u8; 4];
+            file.seek(SeekFrom::Start(self.layout.data_size_pos))?;
+            file.read_exact(&mut b)?;
+            u64::from(u32::from_le_bytes(b))
+        };
+        let available = file
+            .metadata()?
+            .len()
+            .saturating_sub(self.layout.data_start);
+        let bytes = declared.min(available);
+        Ok(bytes - bytes % u64::from(self.block_align))
+    }
+}
+
+/// Random-access reader for the WAV files this app writes (16/24-bit PCM, 32-bit float).
+pub struct WavReader {
+    file: File,
+    spec: WavSpec,
+    data_start: u64,
+    frames: u64,
+    raw: Vec<u8>,
+}
+
+impl WavReader {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let scanned = scan(&mut file)?;
+        let spec = scanned.spec()?;
+        let data_bytes = scanned.data_bytes(&mut file)?;
+        Ok(Self {
+            file,
+            spec,
+            data_start: scanned.layout.data_start,
+            frames: data_bytes / u64::from(spec.block_align()),
+            raw: Vec::new(),
+        })
+    }
+
+    pub fn spec(&self) -> WavSpec {
+        self.spec
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Appends up to `frames` frames starting at `start` to `out` (interleaved f32).
+    /// Returns the number of frames read (fewer at the end of the file).
+    pub fn read(&mut self, start: u64, frames: usize, out: &mut Vec<f32>) -> io::Result<usize> {
+        let frames = (self.frames.saturating_sub(start)).min(frames as u64) as usize;
+        let block = usize::from(self.spec.block_align());
+        self.raw.resize(frames * block, 0);
+        self.file
+            .seek(SeekFrom::Start(self.data_start + start * block as u64))?;
+        self.file.read_exact(&mut self.raw)?;
+        match self.spec.format {
+            SampleFormat::Pcm16 => out.extend(
+                self.raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from(i16::from_le_bytes(*b)) / SCALE_16),
+            ),
+            SampleFormat::Pcm24 => {
+                out.extend(
+                    self.raw.as_chunks::<3>().0.iter().map(|b| {
+                        (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / SCALE_24
+                    }),
+                )
+            }
+            SampleFormat::Float32 => out.extend(
+                self.raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            ),
+        }
+        Ok(frames)
+    }
+}
+
 fn scan(file: &mut File) -> io::Result<Scanned> {
     let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_owned());
     let mut header = [0u8; RIFF_HEADER_LEN as usize];
@@ -524,25 +675,7 @@ pub fn repair(path: &Path) -> io::Result<Repaired> {
         file.seek(SeekFrom::End(0))?;
         file.write_all(&[0])?;
     }
-    let format = match (scanned.format_tag, scanned.bits) {
-        (FORMAT_TAG_PCM, 16) => SampleFormat::Pcm16,
-        (FORMAT_TAG_PCM, 24) => SampleFormat::Pcm24,
-        (FORMAT_TAG_IEEE_FLOAT, 32) => SampleFormat::Float32,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported format tag {} with {} bits",
-                    scanned.format_tag, scanned.bits
-                ),
-            ));
-        }
-    };
-    let spec = WavSpec {
-        channels: scanned.channels,
-        sample_rate: scanned.sample_rate,
-        format,
-    };
+    let spec = scanned.spec()?;
     write_sizes(
         &mut file,
         &scanned.layout,
@@ -794,6 +927,86 @@ mod tests {
         assert_eq!(u32_at(&bytes, cue + 36 + 4), 2); // second position
         assert_eq!(u32_at(&bytes, 4) as usize, bytes.len() - 8);
         assert_eq!(bytes.len() as u64, cue + 8 + 4 + 48);
+    }
+
+    #[test]
+    fn reader_returns_what_was_written_in_every_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples: Vec<f32> = (0..200).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
+        for (format, tolerance) in [
+            (SampleFormat::Pcm16, 2.0 / SCALE_16),
+            (SampleFormat::Pcm24, 1.0 / SCALE_24),
+            (SampleFormat::Float32, 0.0),
+        ] {
+            let path = dir.path().join(format!("{format:?}.wav"));
+            let mut w = WavWriter::create(&path, spec(2, format), &bext(), 0).unwrap();
+            w.write_samples(&samples).unwrap();
+            w.finalize_with_cues(&[10]).unwrap();
+
+            let mut r = WavReader::open(&path).unwrap();
+            assert_eq!(r.frames(), 100);
+            assert_eq!(r.spec(), spec(2, format));
+            let mut out = Vec::new();
+            assert_eq!(r.read(0, 1000, &mut out).unwrap(), 100);
+            for (a, b) in out.iter().zip(&samples) {
+                assert!((a - b).abs() <= tolerance, "{format:?}: {a} vs {b}");
+            }
+            // A read from the middle, clipped at the end of the file.
+            let mut tail = Vec::new();
+            assert_eq!(r.read(90, 50, &mut tail).unwrap(), 10);
+            assert_eq!(tail, out[180..]);
+            assert_eq!(r.read(500, 10, &mut tail).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn append_continues_a_finished_file_and_drops_old_cues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        let s = spec(1, SampleFormat::Float32);
+        let mut w = WavWriter::create(&path, s, &bext(), 0).unwrap();
+        w.write_samples(&[0.1, 0.2, 0.3]).unwrap();
+        w.finalize_with_cues(&[1]).unwrap();
+        drop(w);
+
+        let mut w = WavWriter::open_append(&path, s, None, 0).unwrap();
+        assert_eq!(w.frames_written(), 3);
+        w.write_samples(&[0.4, 0.5]).unwrap();
+        w.finalize_with_cues(&[3]).unwrap();
+        drop(w);
+
+        let mut r = WavReader::open(&path).unwrap();
+        let mut out = Vec::new();
+        r.read(0, 10, &mut out).unwrap();
+        assert_eq!(out, [0.1, 0.2, 0.3, 0.4, 0.5]);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.windows(4).filter(|w| w == b"cue ").count(), 1);
+        assert_eq!(u32_at(&bytes, 4) as usize, bytes.len() - 8);
+    }
+
+    #[test]
+    fn append_can_cut_the_file_at_a_frame_and_rejects_other_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        let s = spec(1, SampleFormat::Pcm24);
+        let mut w = WavWriter::create(&path, s, &bext(), 0).unwrap();
+        w.write_samples(&[0.5, 0.25, -0.5, -0.25]).unwrap();
+        w.finalize().unwrap();
+        drop(w);
+
+        assert!(WavWriter::open_append(&path, spec(1, SampleFormat::Pcm16), None, 0).is_err());
+        assert!(WavWriter::open_append(&path, spec(2, SampleFormat::Pcm24), None, 0).is_err());
+
+        let mut w = WavWriter::open_append(&path, s, Some(2), 0).unwrap();
+        w.write_samples(&[0.125]).unwrap();
+        w.finalize().unwrap();
+        drop(w);
+        let mut out = Vec::new();
+        WavReader::open(&path)
+            .unwrap()
+            .read(0, 10, &mut out)
+            .unwrap();
+        assert_eq!(out, [0.5, 0.25, 0.125]);
     }
 
     #[test]
