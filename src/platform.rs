@@ -147,3 +147,8 @@ pub fn prefers_reduced_motion() -> bool {
         false
     }
 }
+
+/// Moves a file or folder to the Recycle Bin (recoverable, unlike deleting).
+pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    trash::delete(path).map_err(|e| e.to_string())
+}

@@ -14,7 +14,7 @@ use crate::wav::SampleFormat;
 const APP_NAME: &str = "recrec";
 const CONFIG_FILE: &str = "config.json";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub host: Option<String>,
@@ -31,6 +31,46 @@ pub struct AppConfig {
     pub skip_update_check: bool,
     /// A release the user chose not to be told about again.
     pub skipped_version: Option<String>,
+    pub metronome: MetronomeConfig,
+    /// Master level of everything the app plays (monitor mix and click), linear 0..1.
+    pub output_volume: f32,
+    /// Shifts the start of a counted-in take to make up for the interface's round-trip
+    /// latency, in milliseconds (positive = start later).
+    pub latency_comp_ms: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetronomeConfig {
+    /// Master switch: off means no click and no count-in.
+    pub enabled: bool,
+    pub bpm: f64,
+    pub beats_per_bar: u32,
+    /// Note value of a beat: 4 or 8.
+    pub beat_unit: u32,
+    /// Bars counted in before recording starts (0 = start at once).
+    pub count_in_bars: u32,
+    /// Keep clicking while recording (the count-in always clicks).
+    pub click_while_recording: bool,
+    /// Click while idle, for practising.
+    pub click_while_idle: bool,
+    /// Click level, linear 0..1.
+    pub volume: f32,
+}
+
+impl Default for MetronomeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bpm: 120.0,
+            beats_per_bar: 4,
+            beat_unit: 4,
+            count_in_bars: 1,
+            click_while_recording: true,
+            click_while_idle: false,
+            volume: 0.6,
+        }
+    }
 }
 
 pub fn device_key(host: &str, device: &str) -> String {
@@ -63,6 +103,26 @@ pub fn default_output_dir() -> PathBuf {
         .or_else(|| user.as_ref().map(|u| u.home_dir().to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join(APP_NAME)
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            device: None,
+            sample_rate: None,
+            buffer_size: None,
+            format: SampleFormat::default(),
+            preroll_secs: 0,
+            output_dir: None,
+            tracks: BTreeMap::new(),
+            skip_update_check: false,
+            skipped_version: None,
+            metronome: MetronomeConfig::default(),
+            output_volume: 1.0,
+            latency_comp_ms: 0.0,
+        }
+    }
 }
 
 impl AppConfig {
@@ -137,13 +197,26 @@ mod tests {
             tracks: BTreeMap::new(),
             skip_update_check: true,
             skipped_version: Some("0.2.0".into()),
+            metronome: MetronomeConfig {
+                enabled: true,
+                bpm: 96.5,
+                beats_per_bar: 6,
+                beat_unit: 8,
+                count_in_bars: 2,
+                click_while_recording: false,
+                click_while_idle: true,
+                volume: 0.4,
+            },
+            output_volume: 0.8,
+            latency_comp_ms: 12.5,
         };
         cfg.tracks.insert(
             device_key("ASIO", "Audio Interface"),
             vec![Track {
-                name: "Synth".into(),
-                source: Source::Stereo(2, 3),
                 armed: false,
+                monitor: true,
+                volume_db: -3.0,
+                ..Track::new("Synth".into(), Source::Stereo(2, 3))
             }],
         );
         cfg.save(&path).unwrap();

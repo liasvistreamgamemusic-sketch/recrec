@@ -91,6 +91,16 @@ pub struct TrackMeta {
     pub file: String,
 }
 
+/// Metronome settings a take was recorded with.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Tempo {
+    pub bpm: f64,
+    pub beats_per_bar: u32,
+    pub beat_unit: u32,
+    /// Bars counted in before the first recorded sample (0 = none).
+    pub count_in_bars: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TakeMeta {
     pub app_version: String,
@@ -105,6 +115,15 @@ pub struct TakeMeta {
     pub preroll_frames: u64,
     pub dropped_frames: u64,
     pub recovered: bool,
+    /// Free-form note the user attached to the take.
+    #[serde(default)]
+    pub note: String,
+    /// Set when the take started on a bar line of the metronome.
+    #[serde(default)]
+    pub tempo: Option<Tempo>,
+    /// Marker positions in frames from the start of the files.
+    #[serde(default)]
+    pub markers: Vec<u64>,
 }
 
 impl TakeMeta {
@@ -127,6 +146,62 @@ pub fn write_meta(dir: &Path, meta: &TakeMeta) -> io::Result<()> {
 pub fn read_meta(dir: &Path) -> io::Result<TakeMeta> {
     let bytes = fs::read(dir.join(META_FILE))?;
     serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Length of the `YYYY-MM-DD_HHMMSS` stamp every take folder starts with.
+const STAMP_LEN: usize = 17;
+
+fn stamp_of(name: &str) -> Option<&str> {
+    let stamp = name.get(..STAMP_LEN)?;
+    let shape_ok = stamp.bytes().enumerate().all(|(i, b)| match i {
+        4 | 7 => b == b'-',
+        10 => b == b'_',
+        _ => b.is_ascii_digit(),
+    });
+    shape_ok.then_some(stamp)
+}
+
+/// The user-given part of a take folder name (empty when the take has none).
+pub fn label_of(name: &str) -> &str {
+    match stamp_of(name) {
+        Some(_) => name[STAMP_LEN..].strip_prefix('_').unwrap_or(""),
+        None => name,
+    }
+}
+
+/// Renames a take folder so it carries `label` (its time stamp is kept). Returns the new path.
+pub fn rename_take(dir: &Path, label: &str) -> io::Result<PathBuf> {
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, msg.to_owned());
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("take folder has no readable name"))?;
+    let stamp = stamp_of(name).ok_or_else(|| invalid("not a take folder"))?;
+    let label = sanitize_component(label);
+    let new_name = if label.is_empty() {
+        stamp.to_owned()
+    } else {
+        format!("{stamp}_{label}")
+    };
+    let target = dir.with_file_name(&new_name);
+    if target == dir {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{new_name} already exists"),
+        ));
+    }
+    fs::rename(dir, &target)?;
+    Ok(target)
+}
+
+/// Stores a note in the take's metadata.
+pub fn set_note(dir: &Path, note: &str) -> io::Result<()> {
+    let mut meta = read_meta(dir)?;
+    meta.note = note.trim().to_owned();
+    write_meta(dir, &meta)
 }
 
 pub fn create_marker(dir: &Path) -> io::Result<()> {
@@ -282,6 +357,9 @@ mod tests {
             preroll_frames: 0,
             dropped_frames: 0,
             recovered: false,
+            note: String::new(),
+            tempo: None,
+            markers: Vec::new(),
         }
     }
 
@@ -318,6 +396,53 @@ mod tests {
         let b = create_take_dir(root.path(), t(), "").unwrap();
         assert!(a.ends_with("2026-11-10_223015"));
         assert!(b.ends_with("2026-11-10_223015_2"));
+    }
+
+    #[test]
+    fn labels_are_read_from_and_written_to_folder_names() {
+        assert_eq!(label_of("2026-11-10_223015"), "");
+        assert_eq!(label_of("2026-11-10_223015_サビ案"), "サビ案");
+        assert_eq!(label_of("2026-11-10_223015_2"), "2");
+        assert_eq!(label_of("holiday"), "holiday");
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = create_take_dir(root.path(), t(), "").unwrap();
+        let renamed = rename_take(&dir, "A/B").unwrap();
+        assert!(renamed.ends_with("2026-11-10_223015_A_B"));
+        assert!(renamed.is_dir() && !dir.exists());
+        let cleared = rename_take(&renamed, "  ").unwrap();
+        assert!(cleared.ends_with("2026-11-10_223015"));
+        // Same name again is a no-op, a clash is refused, a non-take folder is rejected.
+        assert_eq!(rename_take(&cleared, "").unwrap(), cleared);
+        let other = create_take_dir(root.path(), t(), "x").unwrap();
+        assert!(rename_take(&cleared, "x").is_err());
+        assert!(other.is_dir() && cleared.is_dir());
+        fs::create_dir(root.path().join("misc")).unwrap();
+        assert!(rename_take(&root.path().join("misc"), "y").is_err());
+    }
+
+    #[test]
+    fn notes_are_stored_in_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &meta()).unwrap();
+        set_note(dir.path(), "  2 番のサビが良い \n").unwrap();
+        assert_eq!(read_meta(dir.path()).unwrap().note, "2 番のサビが良い");
+    }
+
+    #[test]
+    fn old_meta_without_new_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = serde_json::to_value(meta()).unwrap();
+        let mut old = json.as_object().unwrap().clone();
+        for key in ["note", "tempo", "markers"] {
+            old.remove(key);
+        }
+        fs::write(
+            dir.path().join(META_FILE),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_meta(dir.path()).unwrap(), meta());
     }
 
     #[test]

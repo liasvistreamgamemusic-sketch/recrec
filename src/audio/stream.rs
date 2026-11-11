@@ -1,4 +1,4 @@
-//! An open input stream together with its meters and writer thread.
+//! An open audio session: input stream, optional output stream, meters and writer thread.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,14 +8,21 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{BufferSize, HostId, SampleFormat, StreamConfig};
 use crossbeam_channel::Receiver;
 
-use super::capture::{Capture, SUPPORTED_FORMATS};
+use super::capture::{Capture, SUPPORTED_FORMATS, Taps};
 use super::devices;
+use super::output::{self, OutputMixer};
 use crate::meter::MeterBank;
 use crate::recorder::{Recorder, RecorderConfig, RecorderEvent};
+use crate::transport::Transport;
+use crate::waveform::{BLOCKS_PER_SECOND, WaveHistory};
 
 /// Seconds of audio the capture ring holds before frames are dropped.
 const RING_SECONDS: usize = 4;
 const STREAM_ERROR_QUEUE: usize = 16;
+/// The monitor ring only bridges the input and output callbacks, so it stays short.
+const MONITOR_RING_DIVISOR: usize = 2;
+/// Seconds of waveform blocks buffered between UI frames.
+const WAVE_RING_SECONDS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInfo {
@@ -31,8 +38,14 @@ pub struct InputSession {
     // Declared first so it is dropped (and its take finalized) before the stream.
     recorder: Recorder,
     _stream: cpal::Stream,
+    _output: Option<cpal::Stream>,
     pub info: SessionInfo,
     pub meters: Arc<MeterBank>,
+    pub transport: Arc<Transport>,
+    /// Why nothing can be played (metronome and monitoring are then unavailable).
+    pub output_error: Option<String>,
+    pub waves: WaveHistory,
+    wave_ring: rtrb::Consumer<f32>,
     dropped_frames: Arc<AtomicU64>,
     stream_errors: Receiver<String>,
 }
@@ -61,7 +74,14 @@ impl InputSession {
             rtrb::RingBuffer::new(sample_rate as usize * channels * RING_SECONDS);
         let meters = Arc::new(MeterBank::new(channels));
         let dropped_frames = Arc::new(AtomicU64::new(0));
-        let mut capture = Capture::new(producer, meters.clone(), dropped_frames.clone());
+        let transport = Arc::new(Transport::new(channels));
+        let (monitor_tx, monitor_rx) =
+            rtrb::RingBuffer::new(sample_rate as usize * channels / MONITOR_RING_DIVISOR);
+        let (wave_tx, wave_ring) =
+            rtrb::RingBuffer::new(BLOCKS_PER_SECOND as usize * channels * 2 * WAVE_RING_SECONDS);
+        let mut capture = Capture::new(producer, meters.clone(), dropped_frames.clone()).with_taps(
+            Taps::new(transport.clone(), monitor_tx, wave_tx, sample_rate),
+        );
         let (err_tx, err_rx) = crossbeam_channel::bounded(STREAM_ERROR_QUEUE);
 
         let stream = device
@@ -80,7 +100,27 @@ impl InputSession {
             .with_context(|| {
                 format!("「{device_name}」を {sample_rate} Hz / {channels} ch で開けません")
             })?;
+        // Build the output before starting anything: ASIO sets up both directions together.
+        let mixer = OutputMixer::new(monitor_rx, transport.clone(), sample_rate);
+        let (output, output_error) =
+            match output::open(host_id, device_name, sample_rate, buffer_size, mixer) {
+                Ok(out) => (Some(out), None),
+                Err(e) => {
+                    log::warn!("output unavailable: {e:#}");
+                    (None, Some(format!("{e:#}")))
+                }
+            };
         stream.play().context("入力ストリームを開始できません")?;
+        let (output, output_error) = match output {
+            Some(out) => match out.play() {
+                Ok(()) => (Some(out), output_error),
+                Err(e) => {
+                    log::warn!("output could not start: {e}");
+                    (None, Some(format!("出力ストリームを開始できません: {e}")))
+                }
+            },
+            None => (None, output_error),
+        };
 
         let recorder = Recorder::spawn(
             consumer,
@@ -101,8 +141,13 @@ impl InputSession {
         Ok(Self {
             recorder,
             _stream: stream,
+            _output: output,
             info,
             meters,
+            transport,
+            output_error,
+            waves: WaveHistory::new(channels),
+            wave_ring,
             dropped_frames,
             stream_errors: err_rx,
         })
@@ -116,6 +161,16 @@ impl InputSession {
         self.dropped_frames.load(Ordering::Relaxed)
     }
 
+    /// Whether the app can play sound (click and monitoring).
+    pub fn has_output(&self) -> bool {
+        self._output.is_some()
+    }
+
+    /// Moves freshly captured waveform blocks into [`Self::waves`].
+    pub fn poll_waveform(&mut self) {
+        self.waves.drain(&mut self.wave_ring);
+    }
+
     pub fn try_stream_error(&self) -> Option<String> {
         self.stream_errors.try_recv().ok()
     }
@@ -123,9 +178,13 @@ impl InputSession {
     /// Finalizes any take and closes the stream. Returns the recorder's last events.
     pub fn close(self) -> Vec<RecorderEvent> {
         let Self {
-            recorder, _stream, ..
+            recorder,
+            _stream,
+            _output,
+            ..
         } = self;
         let events = recorder.shutdown();
+        drop(_output);
         drop(_stream);
         events
     }

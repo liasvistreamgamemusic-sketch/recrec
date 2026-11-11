@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use chrono::{Local, NaiveDateTime, TimeDelta};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 
-use crate::take::{self, TakeMeta, TrackMeta};
+use crate::take::{self, TakeMeta, Tempo, TrackMeta};
 use crate::wav::{Bext, SampleFormat, WavSpec, WavWriter};
 
 pub const MAX_PREROLL_SECS: u32 = 30;
@@ -57,6 +57,10 @@ pub struct TakeRequest {
     pub format: SampleFormat,
     pub host: String,
     pub device: String,
+    /// Input-timeline frame (frames pushed into the ring since the stream opened) at which
+    /// the files begin. `None` starts immediately and keeps the pre-roll.
+    pub start_at: Option<u64>,
+    pub tempo: Option<Tempo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +78,8 @@ pub enum RecorderEvent {
         dir: PathBuf,
     },
     Stopped(TakeSummary),
+    /// A scheduled start was called off before any file was created.
+    Cancelled,
     /// User-facing message (Japanese).
     Error(String),
 }
@@ -81,6 +87,7 @@ pub enum RecorderEvent {
 enum Command {
     Start(TakeRequest),
     Stop,
+    Marker,
     SetPreRoll(u32),
     Shutdown,
 }
@@ -117,6 +124,8 @@ impl Recorder {
             scratch: Vec::new(),
             preroll: PreRoll::new(0),
             take: None,
+            pending: None,
+            frames_seen: 0,
             config,
         };
         let thread = thread::Builder::new()
@@ -136,6 +145,11 @@ impl Recorder {
 
     pub fn stop(&self) {
         self.send(Command::Stop);
+    }
+
+    /// Drops a marker at the current position of the active take.
+    pub fn add_marker(&self) {
+        self.send(Command::Marker);
     }
 
     pub fn set_preroll(&self, secs: u32) {
@@ -223,6 +237,7 @@ struct ActiveTake {
     dir: PathBuf,
     tracks: Vec<OpenTrack>,
     meta: TakeMeta,
+    markers: Vec<u64>,
     dropped_at_start: u64,
     last_header: Instant,
     last_sync: Instant,
@@ -238,6 +253,10 @@ struct Worker {
     scratch: Vec<f32>,
     preroll: PreRoll,
     take: Option<ActiveTake>,
+    /// A take waiting for its `start_at` frame (count-in).
+    pending: Option<TakeRequest>,
+    /// Frames read from the ring so far: the position on the input timeline.
+    frames_seen: u64,
     config: RecorderConfig,
 }
 
@@ -285,16 +304,26 @@ impl Worker {
     fn handle(&mut self, cmd: Command) -> Flow {
         match cmd {
             Command::Start(request) => {
-                if self.take.is_some() {
+                if self.take.is_some() || self.pending.is_some() {
                     log::warn!("start requested while already recording; ignored");
-                } else if let Err(msg) = self.start(request) {
-                    log::error!("could not start take: {msg}");
-                    self.emit(RecorderEvent::Error(msg));
+                } else if request.start_at.is_some_and(|at| at > self.frames_seen) {
+                    self.pending = Some(request);
+                } else {
+                    self.start_or_report(request, true);
                 }
             }
             Command::Stop => {
+                self.cancel_pending();
                 self.drain();
                 self.stop(None);
+            }
+            Command::Marker => {
+                if let Some(take) = self.take.as_mut() {
+                    let at = take.tracks.first().map_or(0, |t| t.writer.frames_written());
+                    if take.markers.last() != Some(&at) {
+                        take.markers.push(at);
+                    }
+                }
             }
             Command::SetPreRoll(secs) => {
                 let samples =
@@ -302,6 +331,7 @@ impl Worker {
                 self.preroll = PreRoll::new(samples);
             }
             Command::Shutdown => {
+                self.cancel_pending();
                 self.drain();
                 self.stop(None);
                 return Flow::Exit;
@@ -316,7 +346,20 @@ impl Worker {
         }
     }
 
-    fn start(&mut self, request: TakeRequest) -> Result<(), String> {
+    fn cancel_pending(&mut self) {
+        if self.pending.take().is_some() {
+            self.emit(RecorderEvent::Cancelled);
+        }
+    }
+
+    fn start_or_report(&mut self, request: TakeRequest, use_preroll: bool) {
+        if let Err(msg) = self.start(request, use_preroll) {
+            log::error!("could not start take: {msg}");
+            self.emit(RecorderEvent::Error(msg));
+        }
+    }
+
+    fn start(&mut self, request: TakeRequest, use_preroll: bool) -> Result<(), String> {
         if request.tracks.is_empty() {
             return Err("録音するトラックがありません".into());
         }
@@ -336,7 +379,10 @@ impl Worker {
         })?;
         check_free_space(&request.root, self.config.min_free_bytes)?;
 
-        let preroll = self.preroll.take();
+        let mut preroll = self.preroll.take();
+        if !use_preroll {
+            preroll.clear();
+        }
         let preroll_frames = (preroll.len() / self.config.channels) as u64;
         let now = Local::now().naive_local();
         let origin = now
@@ -365,6 +411,7 @@ impl Worker {
             dir: dir.clone(),
             tracks,
             meta,
+            markers: Vec::new(),
             dropped_at_start: self.dropped_frames.load(Ordering::Relaxed),
             last_header: now,
             last_sync: now,
@@ -426,6 +473,9 @@ impl Worker {
             preroll_frames,
             dropped_frames: 0,
             recovered: false,
+            note: String::new(),
+            tempo: request.tempo,
+            markers: Vec::new(),
         };
         take::write_meta(dir, &meta).map_err(|e| format!("take.json を書けません: {e}"))?;
         Ok((tracks, meta))
@@ -449,7 +499,21 @@ impl Worker {
         chunk.commit_all();
 
         let samples = std::mem::take(&mut self.scratch);
-        if self.take.is_some() {
+        let before = self.frames_seen;
+        self.frames_seen += (n / channels) as u64;
+        let due = self
+            .pending
+            .as_ref()
+            .and_then(|p| p.start_at)
+            .filter(|at| *at <= self.frames_seen);
+        if let Some(at) = due
+            && let Some(request) = self.pending.take()
+        {
+            // The take begins exactly at frame `at`: skip what came before it in this chunk.
+            let skip = at.saturating_sub(before) as usize * channels;
+            self.start_or_report(request, false);
+            self.write(&samples[skip.min(samples.len())..]);
+        } else if self.take.is_some() {
             self.write(&samples);
         } else {
             self.preroll.push(&samples);
@@ -533,7 +597,7 @@ impl Worker {
         let frames = take.tracks.first().map_or(0, |t| t.writer.frames_written());
         let mut files = Vec::with_capacity(take.tracks.len());
         for t in &mut take.tracks {
-            if let Err(e) = t.writer.finalize() {
+            if let Err(e) = t.writer.finalize_with_cues(&take.markers) {
                 errors.push(format!("{} を閉じられません: {e}", t.path.display()));
             }
             files.push(t.path.clone());
@@ -543,6 +607,7 @@ impl Worker {
             .load(Ordering::Relaxed)
             .saturating_sub(take.dropped_at_start);
         take.meta.frames = frames;
+        take.meta.markers = std::mem::take(&mut take.markers);
         take.meta.dropped_frames = dropped;
         if let Err(e) = take::write_meta(&take.dir, &take.meta) {
             errors.push(format!("take.json を書けません: {e}"));
@@ -648,6 +713,8 @@ mod tests {
             format: SampleFormat::Float32,
             host: "Test".into(),
             device: "Fake".into(),
+            start_at: None,
+            tempo: None,
         }
     }
 
@@ -688,7 +755,7 @@ mod tests {
             match wait_event(r) {
                 RecorderEvent::Stopped(s) => return s,
                 RecorderEvent::Error(e) => panic!("unexpected error: {e}"),
-                RecorderEvent::Started { .. } => {}
+                RecorderEvent::Started { .. } | RecorderEvent::Cancelled => {}
             }
         }
     }
@@ -845,6 +912,83 @@ mod tests {
         );
         assert_eq!(read_float_wav(&dir.join("01_A.wav")).len(), 50);
         assert!(!dir.join(take::MARKER_FILE).exists());
+    }
+
+    #[test]
+    fn scheduled_start_begins_exactly_at_the_requested_frame() {
+        let mut rig = rig();
+        rig.recorder.set_preroll(1);
+        feed(&mut rig.producer, 0, 300);
+        wait_until(|| rig.producer.slots() == CH * 10_000);
+        let mut req = request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![1],
+            }],
+        );
+        req.start_at = Some(450);
+        rig.recorder.start(req);
+        thread::sleep(Duration::from_millis(30));
+        assert!(!rig.recorder.is_recording(), "waits for the start frame");
+        feed(&mut rig.producer, 300, 400);
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        wait_until(|| rig.recorder.frames_recorded() == 250);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+        let a = read_float_wav(&dir.join("01_A.wav"));
+        assert_eq!(a, (450..700).map(|n| sample(n, 1)).collect::<Vec<_>>());
+        assert_eq!(take::read_meta(&dir).unwrap().preroll_frames, 0);
+    }
+
+    #[test]
+    fn stopping_before_a_scheduled_start_cancels_it() {
+        let rig = rig();
+        let mut req = request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        );
+        req.start_at = Some(1_000_000);
+        rig.recorder.start(req);
+        rig.recorder.stop();
+        assert_eq!(wait_event(&rig.recorder), RecorderEvent::Cancelled);
+        assert!(fs::read_dir(rig.root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn markers_are_saved_in_meta_and_as_cue_points() {
+        let mut rig = rig();
+        rig.recorder.start(request(
+            rig.root.path(),
+            vec![TrackRequest {
+                name: "A".into(),
+                channels: vec![0],
+            }],
+        ));
+        let RecorderEvent::Started { dir } = wait_event(&rig.recorder) else {
+            panic!("expected Started");
+        };
+        feed(&mut rig.producer, 0, 120);
+        wait_until(|| rig.recorder.frames_recorded() == 120);
+        rig.recorder.add_marker();
+        feed(&mut rig.producer, 120, 30);
+        wait_until(|| rig.recorder.frames_recorded() == 150);
+        rig.recorder.stop();
+        stopped(&rig.recorder);
+        assert_eq!(take::read_meta(&dir).unwrap().markers, vec![120]);
+        let bytes = fs::read(dir.join("01_A.wav")).unwrap();
+        let cue = bytes.windows(4).rposition(|w| w == b"cue ").unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[cue + 16..cue + 20].try_into().unwrap()),
+            120
+        );
+        // The audio itself is untouched by the trailing chunk.
+        assert_eq!(read_float_wav(&dir.join("01_A.wav")).len(), 150);
     }
 
     #[test]
