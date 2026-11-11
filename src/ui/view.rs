@@ -920,9 +920,6 @@ impl RecrecApp {
         let position = self.play_position();
         let playing = self.is_playing();
         let take_mode = !busy && self.open_take.is_some();
-        if busy {
-            self.lane_span = None;
-        }
         if take_mode {
             self.take_toolbar(ui, lane_width);
         } else {
