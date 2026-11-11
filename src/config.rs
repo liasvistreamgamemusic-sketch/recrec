@@ -41,6 +41,8 @@ pub struct AppConfig {
     pub skip_silent_tracks: bool,
     /// Whether the take list is folded away to give the tracks more room.
     pub takes_collapsed: bool,
+    /// Show bars and beats instead of minutes and seconds (takes recorded on the metronome).
+    pub ruler_bars: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +129,7 @@ impl Default for AppConfig {
             latency_comp_ms: 0.0,
             skip_silent_tracks: true,
             takes_collapsed: false,
+            ruler_bars: false,
         }
     }
 }
@@ -217,6 +220,7 @@ mod tests {
             latency_comp_ms: 12.5,
             skip_silent_tracks: false,
             takes_collapsed: true,
+            ruler_bars: true,
         };
         cfg.tracks.insert(
             device_key("ASIO", "Audio Interface"),

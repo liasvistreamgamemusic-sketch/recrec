@@ -17,7 +17,7 @@ const SCALE: f32 = 127.0;
 /// One block of one lane, quantized to 8 bits per bound (plenty for drawing).
 pub type Block = [i8; 2];
 
-fn quantize(min: f32, max: f32) -> Block {
+pub fn quantize(min: f32, max: f32) -> Block {
     [
         (min * SCALE).floor().clamp(-SCALE, SCALE) as i8,
         (max * SCALE).ceil().clamp(-SCALE, SCALE) as i8,
@@ -84,6 +84,108 @@ impl LaneBuilder {
     pub fn finish(mut self) -> Vec<Block> {
         self.flush();
         self.blocks
+    }
+}
+
+fn merge(a: Block, b: Block) -> Block {
+    [a[0].min(b[0]), a[1].max(b[1])]
+}
+
+fn extent(b: Block) -> Extent {
+    Extent {
+        min: f32::from(b[0]) / SCALE,
+        max: f32::from(b[1]) / SCALE,
+    }
+}
+
+/// Blocks of one lane plus coarser copies (each level merges pairs of the one below), so
+/// any stretch of the lane can be summarized in a few steps however long the recording is.
+#[derive(Debug, Clone, Default)]
+pub struct Pyramid {
+    /// `levels[0]` are the blocks themselves; `levels[k][i]` covers blocks `i << k ..`.
+    levels: Vec<Vec<Block>>,
+}
+
+impl Pyramid {
+    pub fn from_blocks(blocks: &[Block]) -> Self {
+        let mut p = Self::default();
+        for b in blocks {
+            p.push(*b);
+        }
+        p
+    }
+
+    pub fn len(&self) -> usize {
+        self.levels.first().map_or(0, Vec::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn push(&mut self, block: Block) {
+        if self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+        self.levels[0].push(block);
+        let mut k = 0;
+        // Whenever a level gains a full pair, the level above gains their merge.
+        while self.levels[k].len().is_multiple_of(2) {
+            let n = self.levels[k].len();
+            let merged = merge(self.levels[k][n - 2], self.levels[k][n - 1]);
+            if self.levels.len() == k + 1 {
+                self.levels.push(Vec::new());
+            }
+            self.levels[k + 1].push(merged);
+            k += 1;
+        }
+    }
+
+    /// Drops the oldest `count` blocks.
+    pub fn drop_front(&mut self, count: usize) {
+        let keep = self
+            .levels
+            .first()
+            .map(|base| base[count.min(base.len())..].to_vec())
+            .unwrap_or_default();
+        *self = Self::from_blocks(&keep);
+    }
+
+    /// Extent of blocks `lo..hi` (`None` when the range is empty or outside the lane).
+    pub fn range(&self, lo: usize, hi: usize) -> Option<Extent> {
+        let hi = hi.min(self.len());
+        let mut at = lo;
+        let mut acc: Option<Block> = None;
+        while at < hi {
+            // The largest aligned chunk that starts here, fits, and exists at its level.
+            let mut k = (at.trailing_zeros() as usize).min(self.levels.len() - 1);
+            while k > 0 && (at + (1 << k) > hi || (at >> k) >= self.levels[k].len()) {
+                k -= 1;
+            }
+            let b = self.levels[k][at >> k];
+            acc = Some(acc.map_or(b, |a| merge(a, b)));
+            at += 1 << k;
+        }
+        acc.map(extent)
+    }
+
+    /// `columns` extents covering blocks `start .. start + span` (fractional). Columns that
+    /// lie outside the lane are `None`.
+    pub fn columns(&self, start: f64, span: f64, columns: usize) -> Vec<Option<Extent>> {
+        let per_column = span / columns as f64;
+        let len = self.len() as f64;
+        (0..columns)
+            .map(|col| {
+                let from = start + col as f64 * per_column;
+                let to = from + per_column;
+                if to <= 0.0 || from >= len {
+                    return None;
+                }
+                let lo = from.max(0.0) as usize;
+                let hi = (to.ceil() as usize).max(lo + 1);
+                self.range(lo.min(self.len() - 1), hi)
+            })
+            .collect()
     }
 }
 
@@ -182,39 +284,6 @@ impl TakePeaks {
             lanes,
         })
     }
-
-    /// `columns` extents of `lane` covering blocks `start .. start + span` (fractional).
-    /// Columns outside the take are `None`.
-    pub fn columns(
-        &self,
-        lane: usize,
-        start: f64,
-        span: f64,
-        columns: usize,
-    ) -> Vec<Option<Extent>> {
-        let Some(blocks) = self.lanes.get(lane) else {
-            return vec![None; columns];
-        };
-        let per_column = span / columns as f64;
-        (0..columns)
-            .map(|col| {
-                let from = start + col as f64 * per_column;
-                let to = from + per_column;
-                if to <= 0.0 || from >= blocks.len() as f64 {
-                    return None;
-                }
-                let lo = from.max(0.0) as usize;
-                let hi = (to.ceil() as usize).clamp(lo + 1, blocks.len());
-                blocks[lo.min(blocks.len() - 1)..hi]
-                    .iter()
-                    .map(|b| Extent {
-                        min: f32::from(b[0]) / SCALE,
-                        max: f32::from(b[1]) / SCALE,
-                    })
-                    .reduce(Extent::merge)
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -249,6 +318,58 @@ mod tests {
         // Blocks beyond the stated length are dropped.
         let b = LaneBuilder::resume(2, vec![[1, 1], [2, 2], [3, 3]], 2);
         assert_eq!(b.finish(), vec![[1, 1]]);
+    }
+
+    fn ext(min: i8, max: i8) -> Option<Extent> {
+        Some(extent([min, max]))
+    }
+
+    #[test]
+    fn pyramid_ranges_match_a_plain_scan() {
+        let blocks: Vec<Block> = (0..37i32)
+            .map(|i| [-(i % 11 + 1) as i8, ((i * 7) % 13 + 1) as i8])
+            .collect();
+        let p = Pyramid::from_blocks(&blocks);
+        assert_eq!(p.len(), 37);
+        for lo in 0..37 {
+            for hi in lo + 1..=37 {
+                let plain = blocks[lo..hi].iter().copied().reduce(merge).unwrap();
+                assert_eq!(p.range(lo, hi), Some(extent(plain)), "{lo}..{hi}");
+            }
+        }
+        assert_eq!(p.range(5, 5), None);
+        assert_eq!(p.range(40, 50), None);
+        assert_eq!(p.range(30, 99), p.range(30, 37));
+        assert_eq!(Pyramid::default().range(0, 4), None);
+    }
+
+    #[test]
+    fn pyramid_columns_cover_the_requested_window() {
+        let p = Pyramid::from_blocks(&[[-10, 20], [-30, 40], [0, 5]]);
+        assert_eq!(p.columns(0.0, 3.0, 3)[1], ext(-30, 40));
+        // Zoomed out: several blocks per column are merged.
+        assert_eq!(p.columns(0.0, 4.0, 2)[0], ext(-30, 40));
+        // Before the start and after the end there is nothing to draw.
+        let around = p.columns(-2.0, 8.0, 8);
+        assert_eq!(around[0], None);
+        assert_eq!(around[2], ext(-10, 20));
+        assert_eq!(around[7], None);
+        // More columns than blocks: every block still shows.
+        let wide = p.columns(0.0, 3.0, 6);
+        assert_eq!(wide[0], ext(-10, 20));
+        assert_eq!(wide[5], ext(0, 5));
+    }
+
+    #[test]
+    fn dropping_the_front_keeps_the_rest_queryable() {
+        let blocks: Vec<Block> = (0..20).map(|i| [-(i as i8), i as i8]).collect();
+        let mut p = Pyramid::from_blocks(&blocks);
+        p.drop_front(7);
+        assert_eq!(p.len(), 13);
+        assert_eq!(p.range(0, 13), ext(-19, 19));
+        assert_eq!(p.range(0, 1), ext(-7, 7));
+        p.drop_front(100);
+        assert!(p.is_empty());
     }
 
     #[test]
@@ -303,33 +424,5 @@ mod tests {
             p.lanes,
             vec![vec![[63, 127], [-127, -127]], vec![[-64, 0], [31, 32]]]
         );
-    }
-
-    #[test]
-    fn columns_cover_the_requested_window() {
-        let p = peaks();
-        let cols = p.columns(0, 0.0, 3.0, 3);
-        assert_eq!(
-            cols[1],
-            Some(Extent {
-                min: -30.0 / 127.0,
-                max: 40.0 / 127.0
-            })
-        );
-        // Zoomed out: several blocks per column are merged.
-        let merged = p.columns(0, 0.0, 4.0, 2);
-        assert_eq!(
-            merged[0],
-            Some(Extent {
-                min: -30.0 / 127.0,
-                max: 40.0 / 127.0
-            })
-        );
-        // Before the start and after the end there is nothing to draw.
-        let around = p.columns(0, -2.0, 8.0, 8);
-        assert_eq!(around[0], None);
-        assert!(around[2].is_some());
-        assert_eq!(around[7], None);
-        assert_eq!(p.columns(9, 0.0, 3.0, 2), vec![None, None]);
     }
 }

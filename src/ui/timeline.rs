@@ -2,8 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::peaks::TakePeaks;
+use crate::peaks::{Pyramid, TakePeaks};
 use crate::take::{self, TakeMeta};
+use crate::waveform::Extent;
 
 /// Closest zoom: this many frames per pixel (about 1 ms per pixel at 48 kHz).
 const MIN_FRAMES_PER_PX: f64 = 48.0;
@@ -14,8 +15,11 @@ pub(super) struct OpenTake {
     pub meta: TakeMeta,
     /// One file per take track, in `meta.tracks` order.
     pub files: Vec<PathBuf>,
-    pub peaks: TakePeaks,
-    /// Index of the first overview lane of each take track.
+    /// Frames per waveform block.
+    pub block: u32,
+    /// Waveform of every file channel, in track order.
+    pub lanes: Vec<Pyramid>,
+    /// Index of the first lane of each take track.
     lane_start: Vec<usize>,
     pub frames: u64,
     /// Left edge of the view, in frames (may be fractional while scrolling).
@@ -63,7 +67,12 @@ impl OpenTake {
             dir: dir.to_owned(),
             frames: meta.frames,
             files,
-            peaks,
+            block: peaks.block.max(1),
+            lanes: peaks
+                .lanes
+                .iter()
+                .map(|l| Pyramid::from_blocks(l))
+                .collect(),
             lane_start,
             meta,
             view_start: 0.0,
@@ -87,6 +96,42 @@ impl OpenTake {
     pub fn lanes_of(&self, track: usize) -> std::ops::Range<usize> {
         let start = self.lane_start[track];
         start..start + self.meta.tracks[track].inputs.len()
+    }
+
+    /// The whole take squeezed into `columns`: the loudest lane at each point.
+    pub fn overview(&self, columns: usize) -> Vec<Option<Extent>> {
+        let blocks = (self.frames as f64 / f64::from(self.block)).max(1.0);
+        let mut merged: Vec<Option<Extent>> = vec![None; columns];
+        for lane in &self.lanes {
+            for (acc, col) in merged.iter_mut().zip(lane.columns(0.0, blocks, columns)) {
+                *acc = match (*acc, col) {
+                    (Some(a), Some(b)) => Some(a.merge(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+        }
+        merged
+    }
+
+    /// Shows the part of the take between the fractions `start` and `end` (0..1).
+    pub fn set_window(&mut self, start: f64, end: f64, width: f32) {
+        let frames = self.frames.max(1) as f64;
+        let fit = self.fit(width);
+        let zoom =
+            ((end - start) * frames / f64::from(width.max(1.0))).clamp(MIN_FRAMES_PER_PX, fit);
+        self.frames_per_px = (zoom < fit * 0.999).then_some(zoom);
+        self.view_start = start * frames;
+        self.clamp_view(width);
+    }
+
+    /// The visible part of the take as fractions (0..1) of its length.
+    pub fn window(&self, width: f32) -> (f64, f64) {
+        let frames = self.frames.max(1) as f64;
+        let span = self.zoom(width) * f64::from(width);
+        (
+            (self.view_start / frames).clamp(0.0, 1.0),
+            ((self.view_start + span) / frames).clamp(0.0, 1.0),
+        )
     }
 
     pub fn duration_secs(&self) -> f64 {
@@ -180,10 +225,8 @@ mod tests {
                 skipped_silent: Vec::new(),
             },
             files: Vec::new(),
-            peaks: TakePeaks {
-                block: 240,
-                lanes: Vec::new(),
-            },
+            block: 240,
+            lanes: Vec::new(),
             lane_start: vec![0, 1, 3],
             frames,
             view_start: 0.0,
@@ -225,6 +268,22 @@ mod tests {
         assert_eq!(t.zoom(500.0), 960.0);
         assert_eq!(t.view_start, 0.0);
         t.zoom_by(1e9, 0.0, 1000.0);
+        assert_eq!(t.frames_per_px, Some(MIN_FRAMES_PER_PX));
+    }
+
+    #[test]
+    fn the_overview_window_sets_zoom_and_position() {
+        let mut t = take(480_000);
+        assert_eq!(t.window(1000.0), (0.0, 1.0));
+        t.set_window(0.25, 0.5, 1000.0);
+        assert_eq!(t.frames_per_px, Some(120.0));
+        assert_eq!(t.view_start, 120_000.0);
+        assert_eq!(t.window(1000.0), (0.25, 0.5));
+        // Stretching the window over the whole take returns to "fit".
+        t.set_window(0.0, 1.0, 1000.0);
+        assert_eq!(t.frames_per_px, None);
+        // A window narrower than the closest zoom is widened, not rejected.
+        t.set_window(0.5, 0.500_001, 1000.0);
         assert_eq!(t.frames_per_px, Some(MIN_FRAMES_PER_PX));
     }
 

@@ -140,7 +140,12 @@ pub fn waveform(
             [Pos2::new(rect.left(), mid), Pos2::new(rect.right(), mid)],
             Stroke::new(1.0, theme::HAIRLINE),
         );
-        for (col, extent) in waves.columns(*channel, blocks, columns).iter().enumerate() {
+        let start = waves.total_blocks() as f64 - blocks as f64;
+        for (col, extent) in waves
+            .columns(*channel, start, blocks as f64, columns)
+            .iter()
+            .enumerate()
+        {
             let Some(extent) = extent else { continue };
             let recorded = overlay.recording_from.is_some_and(|from| col >= from);
             let clipped = extent.max >= CLIP_THRESHOLD || extent.min <= -CLIP_THRESHOLD;
@@ -708,6 +713,7 @@ pub fn take_lane(
     lanes: &[Vec<Option<Extent>>],
     playhead_px: Option<f32>,
     marker_px: &[f32],
+    grid_px: &[(f32, bool)],
     empty_text: Option<&str>,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
@@ -723,6 +729,20 @@ pub fn take_lane(
             text,
             theme::regular(theme::TEXT_SMALL),
             theme::INK_TERTIARY,
+        );
+    }
+    for (px, bar) in grid_px {
+        let x = rect.left() + px;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(
+                1.0,
+                if *bar {
+                    theme::HAIRLINE_STRONG
+                } else {
+                    theme::HAIRLINE
+                },
+            ),
         );
     }
     let lane_height = rect.height() / lanes.len().max(1) as f32;
@@ -777,76 +797,121 @@ pub fn take_lane(
     response.on_hover_cursor(CursorIcon::Text)
 }
 
-/// What the user did on the [`time_ruler`].
-#[derive(Debug, Default)]
-pub struct RulerAction {
-    /// Pixel (from the left of the lanes) the playhead was dragged or clicked to.
-    pub seek_px: Option<f32>,
-    /// Horizontal drag of the scroll thumb, in pixels of the scroll bar.
-    pub scroll_fraction: Option<f32>,
+/// Tempo grid for bar/beat display: seconds per beat and beats per bar. Bar 1 starts at 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BeatGrid {
+    pub beat_secs: f64,
+    pub beats_per_bar: u32,
 }
 
-/// Time scale above the lanes plus a scroll bar showing which part of the take is visible.
-/// `left..right` is the horizontal extent of the lanes; times are in seconds.
+impl BeatGrid {
+    /// "bar.beat" (both 1-based) of a time, e.g. "12.3".
+    pub fn label(&self, secs: f64) -> String {
+        let beats = (secs.max(0.0) / self.beat_secs).floor() as u64;
+        let per_bar = u64::from(self.beats_per_bar.max(1));
+        format!("{}.{}", beats / per_bar + 1, beats % per_bar + 1)
+    }
+
+    /// Positions (in seconds) of the grid lines between `from` and `to`, each flagged as a
+    /// bar line or not. Lines closer together than `min_gap_secs` are left out.
+    pub fn lines(&self, from: f64, to: f64, min_gap_secs: f64) -> Vec<(f64, bool)> {
+        let per_bar = u64::from(self.beats_per_bar.max(1));
+        // Step in beats: every beat, every bar, or every 2/4/8… bars, whichever is wide enough.
+        let mut step = 1u64;
+        if self.beat_secs < min_gap_secs {
+            step = per_bar;
+            while self.beat_secs * (step as f64) < min_gap_secs {
+                step *= 2;
+            }
+        }
+        let mut lines = Vec::new();
+        let mut k = ((from.max(0.0) / self.beat_secs / step as f64).ceil() as u64) * step;
+        while (k as f64) * self.beat_secs <= to {
+            lines.push(((k as f64) * self.beat_secs, k.is_multiple_of(per_bar)));
+            k += step;
+        }
+        lines
+    }
+}
+
+/// Time scale above the lanes. `(left, right)` is the horizontal extent of the lanes; with a
+/// `grid` the labels are bars (and beats when zoomed in) instead of minutes and seconds.
+/// Returns the pixel (from the left of the lanes) the playhead was clicked or dragged to.
 pub fn time_ruler(
     ui: &mut Ui,
-    left: f32,
-    right: f32,
+    (left, right): (f32, f32),
     view_start_secs: f64,
     secs_per_px: f64,
     total_secs: f64,
     playhead_px: Option<f32>,
-) -> RulerAction {
-    const TICK_ROW: f32 = 18.0;
-    const BAR_ROW: f32 = 8.0;
-    const MIN_LABEL_GAP: f64 = 72.0;
-    let (row, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), TICK_ROW + BAR_ROW),
-        Sense::hover(),
-    );
+    grid: Option<BeatGrid>,
+) -> Option<f32> {
+    const HEIGHT: f32 = 18.0;
+    const MIN_LABEL_GAP: f64 = 64.0;
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), HEIGHT), Sense::hover());
     let width = (right - left).max(1.0);
-    let ticks = Rect::from_min_max(
-        Pos2::new(left, row.top()),
-        Pos2::new(right, row.top() + TICK_ROW),
-    );
-    let bar = Rect::from_min_max(
-        Pos2::new(left, ticks.bottom() + 2.0),
-        Pos2::new(right, row.bottom() - 2.0),
-    );
-    let mut action = RulerAction::default();
+    let ticks = Rect::from_min_max(Pos2::new(left, row.top()), Pos2::new(right, row.bottom()));
     let painter = ui.painter_at(row);
-
-    // Labels at a "round" interval wide enough not to collide.
-    let steps = [
-        0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0,
-    ];
-    let step = steps
-        .into_iter()
-        .find(|s| s / secs_per_px >= MIN_LABEL_GAP)
-        .unwrap_or(1800.0);
-    let mut t = (view_start_secs / step).ceil() * step;
-    while t <= view_start_secs + f64::from(width) * secs_per_px && t <= total_secs {
-        let x = left + ((t - view_start_secs) / secs_per_px) as f32;
+    let view_end_secs = (view_start_secs + f64::from(width) * secs_per_px).min(total_secs);
+    let x_of = |t: f64| left + ((t - view_start_secs) / secs_per_px) as f32;
+    let tick = |x: f32, tall: bool| {
         painter.line_segment(
             [
-                Pos2::new(x, ticks.bottom() - 5.0),
+                Pos2::new(x, ticks.bottom() - if tall { 6.0 } else { 3.0 }),
                 Pos2::new(x, ticks.bottom()),
             ],
             Stroke::new(1.0, theme::HAIRLINE_STRONG),
         );
-        let label = if step < 1.0 {
-            format!("{}:{:04.1}", (t / 60.0) as u64, t % 60.0)
-        } else {
-            format!("{}:{:02}", (t / 60.0) as u64, (t % 60.0) as u64)
-        };
+    };
+    let label = |x: f32, text: String| {
         painter.text(
             Pos2::new(x + 3.0, ticks.center().y - 1.0),
             Align2::LEFT_CENTER,
-            label,
+            text,
             theme::mono(10.0),
             theme::INK_TERTIARY,
         );
-        t += step;
+    };
+
+    match grid {
+        Some(grid) => {
+            // Labeled lines far enough apart to read; unlabeled ticks for the finer grid.
+            for (t, bar) in grid.lines(view_start_secs, view_end_secs, 6.0 * secs_per_px) {
+                tick(x_of(t), bar);
+            }
+            let labeled = grid.lines(view_start_secs, view_end_secs, MIN_LABEL_GAP * secs_per_px);
+            let beats_labeled = labeled.iter().any(|(_, bar)| !bar);
+            for (t, _) in labeled {
+                let text = grid.label(t + grid.beat_secs * 0.5);
+                // Whole bars read better without the ".1".
+                let text = if beats_labeled {
+                    text
+                } else {
+                    text.split('.').next().unwrap_or_default().to_owned()
+                };
+                label(x_of(t), text);
+            }
+        }
+        None => {
+            let steps = [
+                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+            ];
+            let step = steps
+                .into_iter()
+                .find(|s| s / secs_per_px >= MIN_LABEL_GAP)
+                .unwrap_or(3600.0);
+            let mut t = (view_start_secs.max(0.0) / step).ceil() * step;
+            while t <= view_end_secs {
+                tick(x_of(t), true);
+                let text = if step < 1.0 {
+                    format!("{}:{:04.1}", (t / 60.0) as u64, t % 60.0)
+                } else {
+                    format!("{}:{:02}", (t / 60.0) as u64, (t % 60.0) as u64)
+                };
+                label(x_of(t), text);
+                t += step;
+            }
+        }
     }
     if let Some(px) = playhead_px.filter(|px| (0.0..=width).contains(px)) {
         let x = left + px;
@@ -860,54 +925,153 @@ pub fn time_ruler(
             Stroke::NONE,
         ));
     }
-    let ticks_response = ui.interact(
+    let response = ui.interact(
         ticks,
         ui.scope_id().with("ruler_ticks"),
         Sense::click_and_drag(),
     );
-    if (ticks_response.clicked() || ticks_response.dragged())
-        && let Some(pos) = ticks_response.interact_pointer_pos()
-    {
-        action.seek_px = Some((pos.x - left).clamp(0.0, width));
-    }
-    ticks_response.on_hover_cursor(CursorIcon::PointingHand);
+    let seek = (response.clicked() || response.dragged())
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+        .map(|pos| (pos.x - left).clamp(0.0, width));
+    response.on_hover_cursor(CursorIcon::PointingHand);
+    seek
+}
 
-    // Scroll bar: the thumb is the visible share of the take.
-    painter.rect_filled(bar, CornerRadius::same(2), theme::SURFACE_2);
-    let visible = (f64::from(width) * secs_per_px / total_secs.max(1e-9)).min(1.0) as f32;
-    if visible < 1.0 {
-        let start = (view_start_secs / total_secs) as f32;
-        let thumb = Rect::from_min_max(
-            Pos2::new(bar.left() + start * bar.width(), bar.top()),
-            Pos2::new(bar.left() + (start + visible) * bar.width(), bar.bottom()),
+/// Which part of the overview window a drag holds on to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Grab {
+    /// The whole window, held this many pixels right of its left edge.
+    Move(f32),
+    Left,
+    Right,
+}
+
+/// Miniature of the whole take with a window marking the part shown in the lanes. Drag the
+/// window to scroll, drag its edges to zoom, click elsewhere to jump there. `window` and the
+/// result are fractions (0..1) of the take.
+pub fn overview(
+    ui: &mut Ui,
+    (left, right): (f32, f32),
+    columns: &[Option<Extent>],
+    window: (f64, f64),
+    playhead: Option<f64>,
+) -> Option<(f64, f64)> {
+    const HEIGHT: f32 = 26.0;
+    const EDGE: f32 = 6.0;
+    const MIN_WINDOW_PX: f32 = 8.0;
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), HEIGHT), Sense::hover());
+    let rect = Rect::from_min_max(
+        Pos2::new(left, row.top() + 2.0),
+        Pos2::new(right, row.bottom() - 2.0),
+    );
+    let width = rect.width().max(1.0);
+    let id = ui.scope_id().with("overview");
+    let response = ui.interact(rect, id, Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(theme::RADIUS_XS), theme::SURFACE_2);
+
+    let mid = rect.center().y;
+    let half = rect.height() / 2.0 - 2.0;
+    for (col, extent) in columns.iter().enumerate() {
+        let Some(extent) = extent else { continue };
+        let x = rect.left() + col as f32 + 0.5;
+        let reach = extent.max.abs().max(extent.min.abs()).clamp(0.0, 1.0) * half;
+        painter.line_segment(
+            [
+                Pos2::new(x, mid - reach.max(0.5)),
+                Pos2::new(x, mid + reach.max(0.5)),
+            ],
+            Stroke::new(1.0, theme::INK_TERTIARY),
         );
-        let response = ui.interact(
-            bar.expand2(Vec2::new(0.0, 3.0)),
-            ui.scope_id().with("ruler_scroll"),
-            Sense::click_and_drag(),
-        );
-        let hot = response.hovered() || response.dragged();
-        painter.rect_filled(
-            thumb,
-            CornerRadius::same(2),
-            if hot {
-                theme::INK_SUBTLE
-            } else {
-                theme::HAIRLINE_STRONG
-            },
-        );
-        if response.dragged() {
-            action.scroll_fraction = Some(response.drag_delta().x / bar.width());
-        } else if response.clicked()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            // Clicking beside the thumb centers the view there.
-            let target = (pos.x - bar.left()) / bar.width() - visible / 2.0;
-            action.scroll_fraction = Some(target - start);
-        }
-        response.on_hover_cursor(CursorIcon::Grab);
     }
-    action
+
+    let x_left = rect.left() + window.0 as f32 * width;
+    let x_right = rect.left() + window.1 as f32 * width;
+    let shown = Rect::from_min_max(
+        Pos2::new(x_left, rect.top()),
+        Pos2::new(x_right.max(x_left + 2.0), rect.bottom()),
+    );
+    let hot = response.hovered() || response.dragged();
+    painter.rect(
+        shown,
+        CornerRadius::same(theme::RADIUS_XS),
+        theme::INK.gamma_multiply(if hot { 0.14 } else { 0.08 }),
+        Stroke::new(
+            1.0,
+            if hot {
+                theme::INK_MUTED
+            } else {
+                theme::INK_SUBTLE
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    if let Some(p) = playhead.filter(|p| (0.0..=1.0).contains(p)) {
+        let x = rect.left() + p as f32 * width;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0, theme::INK),
+        );
+    }
+
+    let pointer = response.interact_pointer_pos().or(response.hover_pos());
+    let part_at = |x: f32| -> Option<Grab> {
+        if (x - x_left).abs() <= EDGE {
+            Some(Grab::Left)
+        } else if (x - x_right).abs() <= EDGE {
+            Some(Grab::Right)
+        } else if (x_left..=x_right).contains(&x) {
+            Some(Grab::Move(x - x_left))
+        } else {
+            None
+        }
+    };
+    if let Some(pos) = pointer {
+        ui.ctx().set_cursor_icon(match part_at(pos.x) {
+            Some(Grab::Left | Grab::Right) => CursorIcon::ResizeHorizontal,
+            Some(Grab::Move(_)) => CursorIcon::Grab,
+            None => CursorIcon::PointingHand,
+        });
+    }
+
+    let length = (window.1 - window.0).max(0.0);
+    let fraction = |x: f32| f64::from(((x - rect.left()) / width).clamp(0.0, 1.0));
+    let centered = |x: f32| {
+        let start = (fraction(x) - length / 2.0).clamp(0.0, (1.0 - length).max(0.0));
+        (start, start + length)
+    };
+    let mut result = None;
+    if response.drag_started()
+        && let Some(pos) = pointer
+    {
+        // Pressing outside the window first brings the window there, then drags it.
+        let grab = part_at(pos.x).unwrap_or(Grab::Move(length as f32 * width / 2.0));
+        if part_at(pos.x).is_none() {
+            result = Some(centered(pos.x));
+        }
+        ui.data_mut(|d| d.insert_temp(id, grab));
+    }
+    if response.dragged()
+        && let Some(pos) = pointer
+        && let Some(grab) = ui.data(|d| d.get_temp::<Grab>(id))
+    {
+        let min_len = f64::from(MIN_WINDOW_PX / width);
+        result = Some(match grab {
+            Grab::Move(offset) => {
+                let start = fraction(pos.x - offset).min((1.0 - length).max(0.0));
+                (start, start + length)
+            }
+            Grab::Left => (fraction(pos.x).min(window.1 - min_len).max(0.0), window.1),
+            Grab::Right => (window.0, fraction(pos.x).max(window.0 + min_len).min(1.0)),
+        });
+    } else if response.clicked()
+        && let Some(pos) = pointer
+        && part_at(pos.x).is_none()
+    {
+        result = Some(centered(pos.x));
+    }
+    result
 }
 
 /// Round transport button (play, stop, pause…) with an icon.
@@ -963,4 +1127,50 @@ pub fn transport_button(ui: &mut Ui, glyph: &str, tooltip: &str, active: bool) -
     response
         .on_hover_text(tooltip)
         .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GRID: BeatGrid = BeatGrid {
+        beat_secs: 0.5,
+        beats_per_bar: 4,
+    };
+
+    #[test]
+    fn bar_and_beat_labels_are_one_based() {
+        assert_eq!(GRID.label(0.0), "1.1");
+        assert_eq!(GRID.label(0.49), "1.1");
+        assert_eq!(GRID.label(0.5), "1.2");
+        assert_eq!(GRID.label(2.0), "2.1");
+        assert_eq!(GRID.label(23.6), "12.4");
+    }
+
+    #[test]
+    fn grid_lines_thin_out_as_the_view_zooms_out() {
+        // Zoomed in: every beat, bars flagged.
+        assert_eq!(
+            GRID.lines(0.0, 2.0, 0.1),
+            vec![
+                (0.0, true),
+                (0.5, false),
+                (1.0, false),
+                (1.5, false),
+                (2.0, true)
+            ]
+        );
+        // Beats too close: bars only.
+        assert_eq!(
+            GRID.lines(1.0, 6.0, 1.0),
+            vec![(2.0, true), (4.0, true), (6.0, true)]
+        );
+        // Bars too close: every second, fourth… bar.
+        assert_eq!(
+            GRID.lines(0.0, 16.0, 5.0),
+            vec![(0.0, true), (8.0, true), (16.0, true)]
+        );
+        // Nothing before time zero.
+        assert_eq!(GRID.lines(-3.0, 0.6, 0.1), vec![(0.0, true), (0.5, false)]);
+    }
 }
