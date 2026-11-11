@@ -7,7 +7,7 @@ use eframe::egui::{
 
 use super::theme::{self, icon};
 use crate::meter::{CLIP_THRESHOLD, METER_FLOOR_DB, MeterDisplay};
-use crate::waveform::WaveHistory;
+use crate::waveform::{Extent, WaveHistory};
 
 const GREEN_BELOW_DB: f32 = -18.0;
 const YELLOW_BELOW_DB: f32 = -6.0;
@@ -105,10 +105,10 @@ pub fn waveform(
     channels: &[usize],
     blocks: usize,
     overlay: &dyn Fn(usize) -> WaveOverlay,
-) {
+) -> Rect {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     if !ui.is_rect_visible(rect) {
-        return;
+        return rect;
     }
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same(theme::RADIUS_XS), theme::SURFACE_2);
@@ -175,6 +175,7 @@ pub fn waveform(
             theme::INK,
         );
     }
+    rect
 }
 
 /// Peak-hold readout such as "-12.3".
@@ -697,4 +698,269 @@ pub fn beat_lights(ui: &mut Ui, beats_per_bar: u32, current: Option<(u32, f32)>)
             theme::mix(theme::SURFACE_4, theme::INK, glow),
         );
     }
+}
+
+/// A lane of an opened take: its waveform for the visible window, markers and the playhead.
+/// Click or drag to move the playhead (the response carries the pointer).
+pub fn take_lane(
+    ui: &mut Ui,
+    size: Vec2,
+    lanes: &[Vec<Option<Extent>>],
+    playhead_px: Option<f32>,
+    marker_px: &[f32],
+    empty_text: Option<&str>,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(theme::RADIUS_XS), theme::SURFACE_2);
+    if let Some(text) = empty_text {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            text,
+            theme::regular(theme::TEXT_SMALL),
+            theme::INK_TERTIARY,
+        );
+    }
+    let lane_height = rect.height() / lanes.len().max(1) as f32;
+    for (lane, columns) in lanes.iter().enumerate() {
+        let mid = rect.top() + lane_height * (lane as f32 + 0.5);
+        let half = lane_height / 2.0 - 1.0;
+        painter.line_segment(
+            [Pos2::new(rect.left(), mid), Pos2::new(rect.right(), mid)],
+            Stroke::new(1.0, theme::HAIRLINE),
+        );
+        for (col, extent) in columns.iter().enumerate() {
+            let Some(extent) = extent else { continue };
+            let x = rect.left() + col as f32 + 0.5;
+            let played = playhead_px.is_some_and(|p| (col as f32) < p);
+            let color = if extent.max >= CLIP_THRESHOLD || extent.min <= -CLIP_THRESHOLD {
+                theme::WARN
+            } else if played {
+                theme::INK_MUTED
+            } else {
+                theme::INK_SUBTLE
+            };
+            let top = mid - extent.max.clamp(-1.0, 1.0) * half;
+            let bottom = mid - extent.min.clamp(-1.0, 1.0) * half;
+            let (top, bottom) = if bottom - top < 1.0 {
+                (mid - 0.5, mid + 0.5)
+            } else {
+                (top, bottom)
+            };
+            painter.line_segment(
+                [Pos2::new(x, top), Pos2::new(x, bottom)],
+                Stroke::new(1.0, color),
+            );
+        }
+    }
+    for px in marker_px
+        .iter()
+        .filter(|px| (0.0..=rect.width()).contains(*px))
+    {
+        let x = rect.left() + px;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0, theme::INK_TERTIARY),
+        );
+    }
+    if let Some(px) = playhead_px.filter(|px| (0.0..=rect.width()).contains(px)) {
+        let x = rect.left() + px;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.5, theme::INK),
+        );
+    }
+    response.on_hover_cursor(CursorIcon::Text)
+}
+
+/// What the user did on the [`time_ruler`].
+#[derive(Debug, Default)]
+pub struct RulerAction {
+    /// Pixel (from the left of the lanes) the playhead was dragged or clicked to.
+    pub seek_px: Option<f32>,
+    /// Horizontal drag of the scroll thumb, in pixels of the scroll bar.
+    pub scroll_fraction: Option<f32>,
+}
+
+/// Time scale above the lanes plus a scroll bar showing which part of the take is visible.
+/// `left..right` is the horizontal extent of the lanes; times are in seconds.
+pub fn time_ruler(
+    ui: &mut Ui,
+    left: f32,
+    right: f32,
+    view_start_secs: f64,
+    secs_per_px: f64,
+    total_secs: f64,
+    playhead_px: Option<f32>,
+) -> RulerAction {
+    const TICK_ROW: f32 = 18.0;
+    const BAR_ROW: f32 = 8.0;
+    const MIN_LABEL_GAP: f64 = 72.0;
+    let (row, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), TICK_ROW + BAR_ROW),
+        Sense::hover(),
+    );
+    let width = (right - left).max(1.0);
+    let ticks = Rect::from_min_max(
+        Pos2::new(left, row.top()),
+        Pos2::new(right, row.top() + TICK_ROW),
+    );
+    let bar = Rect::from_min_max(
+        Pos2::new(left, ticks.bottom() + 2.0),
+        Pos2::new(right, row.bottom() - 2.0),
+    );
+    let mut action = RulerAction::default();
+    let painter = ui.painter_at(row);
+
+    // Labels at a "round" interval wide enough not to collide.
+    let steps = [
+        0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ];
+    let step = steps
+        .into_iter()
+        .find(|s| s / secs_per_px >= MIN_LABEL_GAP)
+        .unwrap_or(1800.0);
+    let mut t = (view_start_secs / step).ceil() * step;
+    while t <= view_start_secs + f64::from(width) * secs_per_px && t <= total_secs {
+        let x = left + ((t - view_start_secs) / secs_per_px) as f32;
+        painter.line_segment(
+            [
+                Pos2::new(x, ticks.bottom() - 5.0),
+                Pos2::new(x, ticks.bottom()),
+            ],
+            Stroke::new(1.0, theme::HAIRLINE_STRONG),
+        );
+        let label = if step < 1.0 {
+            format!("{}:{:04.1}", (t / 60.0) as u64, t % 60.0)
+        } else {
+            format!("{}:{:02}", (t / 60.0) as u64, (t % 60.0) as u64)
+        };
+        painter.text(
+            Pos2::new(x + 3.0, ticks.center().y - 1.0),
+            Align2::LEFT_CENTER,
+            label,
+            theme::mono(10.0),
+            theme::INK_TERTIARY,
+        );
+        t += step;
+    }
+    if let Some(px) = playhead_px.filter(|px| (0.0..=width).contains(px)) {
+        let x = left + px;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(x - 5.0, ticks.bottom() - 7.0),
+                Pos2::new(x + 5.0, ticks.bottom() - 7.0),
+                Pos2::new(x, ticks.bottom()),
+            ],
+            theme::INK,
+            Stroke::NONE,
+        ));
+    }
+    let ticks_response = ui.interact(
+        ticks,
+        ui.scope_id().with("ruler_ticks"),
+        Sense::click_and_drag(),
+    );
+    if (ticks_response.clicked() || ticks_response.dragged())
+        && let Some(pos) = ticks_response.interact_pointer_pos()
+    {
+        action.seek_px = Some((pos.x - left).clamp(0.0, width));
+    }
+    ticks_response.on_hover_cursor(CursorIcon::PointingHand);
+
+    // Scroll bar: the thumb is the visible share of the take.
+    painter.rect_filled(bar, CornerRadius::same(2), theme::SURFACE_2);
+    let visible = (f64::from(width) * secs_per_px / total_secs.max(1e-9)).min(1.0) as f32;
+    if visible < 1.0 {
+        let start = (view_start_secs / total_secs) as f32;
+        let thumb = Rect::from_min_max(
+            Pos2::new(bar.left() + start * bar.width(), bar.top()),
+            Pos2::new(bar.left() + (start + visible) * bar.width(), bar.bottom()),
+        );
+        let response = ui.interact(
+            bar.expand2(Vec2::new(0.0, 3.0)),
+            ui.scope_id().with("ruler_scroll"),
+            Sense::click_and_drag(),
+        );
+        let hot = response.hovered() || response.dragged();
+        painter.rect_filled(
+            thumb,
+            CornerRadius::same(2),
+            if hot {
+                theme::INK_SUBTLE
+            } else {
+                theme::HAIRLINE_STRONG
+            },
+        );
+        if response.dragged() {
+            action.scroll_fraction = Some(response.drag_delta().x / bar.width());
+        } else if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            // Clicking beside the thumb centers the view there.
+            let target = (pos.x - bar.left()) / bar.width() - visible / 2.0;
+            action.scroll_fraction = Some(target - start);
+        }
+        response.on_hover_cursor(CursorIcon::Grab);
+    }
+    action
+}
+
+/// Round transport button (play, stop, pause…) with an icon.
+pub fn transport_button(ui: &mut Ui, glyph: &str, tooltip: &str, active: bool) -> Response {
+    let sense = if ui.is_enabled() {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), sense);
+    let hover = theme::animate(
+        ui.ctx(),
+        response.id.with("hover"),
+        ui.is_enabled() && response.hovered(),
+        theme::DURATION_FAST,
+    );
+    let on = theme::animate(
+        ui.ctx(),
+        response.id.with("on"),
+        active,
+        theme::DURATION_FAST,
+    );
+    let painter = ui.painter();
+    let fill = theme::mix(
+        theme::mix(theme::SURFACE_3, theme::SURFACE_4, hover),
+        theme::INK,
+        on,
+    );
+    painter.circle_filled(rect.center(), 15.0, fill);
+    painter.circle_stroke(
+        rect.center(),
+        15.0,
+        Stroke::new(
+            1.0,
+            theme::mix(theme::HAIRLINE_STRONG, theme::INK_SUBTLE, hover),
+        ),
+    );
+    let idle = if ui.is_enabled() {
+        theme::INK_MUTED
+    } else {
+        theme::INK_TERTIARY.gamma_multiply(0.6)
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        theme::icons(theme::ICON_SIZE),
+        theme::mix(theme::mix(idle, theme::INK, hover), theme::CANVAS, on),
+    );
+    if response.has_focus() {
+        painter.circle_stroke(rect.center(), 17.0, focus_stroke());
+    }
+    response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(CursorIcon::PointingHand)
 }

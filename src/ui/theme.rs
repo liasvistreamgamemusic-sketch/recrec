@@ -270,11 +270,16 @@ pub mod icon {
     pub const HEADPHONES: &str = "\u{E2A6}";
     pub const KEYBOARD: &str = "\u{E2D8}";
     pub const METRONOME: &str = "\u{EC8E}";
+    pub const PAUSE: &str = "\u{E39E}";
     pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
+    pub const PLAY: &str = "\u{E3D0}";
     pub const PLUS: &str = "\u{E3D4}";
+    pub const SKIP_BACK: &str = "\u{E5A4}";
     pub const SLIDERS_HORIZONTAL: &str = "\u{E434}";
+    pub const STOP: &str = "\u{E46C}";
     pub const TRASH: &str = "\u{E4A6}";
     pub const WARNING: &str = "\u{E4E0}";
     pub const WARNING_CIRCLE: &str = "\u{E4E2}";
     pub const WAVEFORM: &str = "\u{E802}";
+    pub const X: &str = "\u{E4F6}";
 }

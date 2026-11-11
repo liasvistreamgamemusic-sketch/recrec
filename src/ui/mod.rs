@@ -2,6 +2,7 @@
 
 mod app;
 mod theme;
+mod timeline;
 mod view;
 mod widgets;
 

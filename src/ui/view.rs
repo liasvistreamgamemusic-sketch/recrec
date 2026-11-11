@@ -15,7 +15,7 @@ use super::theme::{self, icon};
 use super::widgets::{
     RECORD_BUTTON_SIZE, WaveOverlay, arm_toggle, badge, beat_lights, clip_badge, db_readout,
     field_label, file_chip, icon_button, record_button, section_label, segmented, switch,
-    toggle_chip, usage_bar, vmeter, waveform,
+    take_lane, time_ruler, toggle_chip, transport_button, usage_bar, vmeter, waveform,
 };
 use crate::meter::{METER_FLOOR_DB, MeterDisplay};
 use crate::metronome;
@@ -57,6 +57,15 @@ impl RecrecApp {
             }
             if ui.input(|i| i.key_pressed(egui::Key::M)) {
                 self.add_marker();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::P)) {
+                self.toggle_pause();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.toggle_play();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Home)) {
+                self.seek(0);
             }
         }
 
@@ -621,7 +630,19 @@ impl RecrecApp {
                     if record_button(ui, busy, self.can_record() || busy).clicked() {
                         self.toggle_recording();
                     }
-                    ui.add_space(theme::SPACE_LG);
+                    // Always present (disabled when idle) so the clock never shifts.
+                    let paused = self.is_paused();
+                    ui.add_enabled_ui(recording, |ui| {
+                        let (glyph, tip) = if paused {
+                            (icon::PLAY, "録音を再開 (P) — 同じテイクの続きに録ります")
+                        } else {
+                            (icon::PAUSE, "一時停止 (P) — テイクを閉じずに止めます")
+                        };
+                        if transport_button(ui, glyph, tip, paused).clicked() {
+                            self.toggle_pause();
+                        }
+                    });
+                    ui.add_space(theme::SPACE_SM);
                     ui.vertical(|ui| {
                         // Fixed width, so the summary line (which grows when the metronome
                         // is on) cannot push the take-name field around.
@@ -779,7 +800,9 @@ impl RecrecApp {
                 4.0,
                 theme::mix(theme::INK_TERTIARY, theme::REC, rec_t).gamma_multiply(blink),
             );
-            let text = if recording {
+            let text = if recording && self.is_paused() {
+                "一時停止中 (P で再開)"
+            } else if recording {
                 "録音中"
             } else if self.count_in_beat().is_some() {
                 "カウントイン (Space で中止)"
@@ -877,6 +900,53 @@ impl RecrecApp {
                 });
             });
         });
+
+        // An opened take replaces the live lanes with its timeline (not while recording).
+        let lane_width = self.lane_span.map_or(400.0, |(l, r)| (r - l).max(1.0));
+        let position = self.play_position();
+        let playing = self.is_playing();
+        if busy {
+            self.lane_span = None;
+        } else if self.open_take.is_some() {
+            self.take_toolbar(ui, lane_width);
+        }
+        let view = self.open_take.as_mut().filter(|_| !busy).map(|t| {
+            let frames_per_px = t.zoom(lane_width);
+            if playing {
+                t.follow(position, lane_width);
+            }
+            t.clamp_view(lane_width);
+            (t.view_start, frames_per_px)
+        });
+        if let (Some((view_start, frames_per_px)), Some((left, right)), Some(take)) =
+            (view, self.lane_span, &self.open_take)
+        {
+            let rate = f64::from(take.meta.sample_rate.max(1));
+            let action = time_ruler(
+                ui,
+                left,
+                right,
+                view_start / rate,
+                frames_per_px / rate,
+                take.duration_secs(),
+                Some(((position as f64 - view_start) / frames_per_px) as f32),
+            );
+            if let Some(px) = action.seek_px {
+                let frame = self.open_take.as_mut().map(|t| t.frame_at(px, lane_width));
+                if let Some(frame) = frame {
+                    self.seek(frame);
+                }
+            }
+            if let (Some(fraction), Some(t)) = (action.scroll_fraction, &mut self.open_take) {
+                t.view_start += f64::from(fraction) * t.frames as f64;
+                t.clamp_view(lane_width);
+            }
+        }
+        let view = self.open_take.as_ref().zip(view);
+        let mut seek: Option<u64> = None;
+        let mut zoom: Option<(f64, f32)> = None;
+        let mut scroll_px = 0.0f32;
+        let mut span: Option<(f32, f32)> = None;
 
         let fallback_names = track::fallback_names(channels);
         let names = self
@@ -1009,22 +1079,77 @@ impl RecrecApp {
                                     let width = (ui.available_width() - trailing).max(60.0);
                                     ui.scope(|ui| {
                                         ui.set_opacity(theme::lerp(0.35, 1.0, armed_t));
-                                        match waves {
-                                            Some(waves) => waveform(
+                                        let size = Vec2::new(width, TRACK_LANE_HEIGHT);
+                                        let lane = match (view, waves) {
+                                            (Some((take, (view_start, frames_per_px))), _) => {
+                                                let block = f64::from(take.peaks.block.max(1));
+                                                let px_of = |frame: u64| {
+                                                    ((frame as f64 - view_start) / frames_per_px)
+                                                        as f32
+                                                };
+                                                let lanes: Vec<_> = take
+                                                    .track_for(&sources)
+                                                    .map(|t| take.lanes_of(t))
+                                                    .unwrap_or(0..0)
+                                                    .map(|l| {
+                                                        take.peaks.columns(
+                                                            l,
+                                                            view_start / block,
+                                                            frames_per_px * f64::from(width)
+                                                                / block,
+                                                            width.floor().max(1.0) as usize,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                let markers: Vec<f32> = take
+                                                    .meta
+                                                    .markers
+                                                    .iter()
+                                                    .map(|m| px_of(*m))
+                                                    .collect();
+                                                let response = take_lane(
+                                                    ui,
+                                                    size,
+                                                    &lanes,
+                                                    Some(px_of(position)),
+                                                    &markers,
+                                                    lanes.is_empty().then_some(
+                                                        "このテイクには録音されていません",
+                                                    ),
+                                                );
+                                                let left = response.rect.left();
+                                                if (response.clicked() || response.dragged())
+                                                    && let Some(pos) =
+                                                        response.interact_pointer_pos()
+                                                {
+                                                    let px = (pos.x - left).clamp(0.0, width);
+                                                    let frame =
+                                                        view_start + f64::from(px) * frames_per_px;
+                                                    seek = Some(frame.max(0.0) as u64);
+                                                }
+                                                if let Some(pos) = response.hover_pos() {
+                                                    let (factor, dx) = ui.input(|i| {
+                                                        (i.zoom_delta(), i.smooth_scroll_delta.x)
+                                                    });
+                                                    if factor != 1.0 {
+                                                        zoom =
+                                                            Some((f64::from(factor), pos.x - left));
+                                                    }
+                                                    scroll_px -= dx;
+                                                }
+                                                response.rect
+                                            }
+                                            (None, Some(waves)) => waveform(
                                                 ui,
-                                                Vec2::new(width, TRACK_LANE_HEIGHT),
+                                                size,
                                                 waves,
                                                 &sources,
                                                 WAVE_WINDOW_BLOCKS,
                                                 &overlay,
                                             ),
-                                            None => {
-                                                ui.allocate_space(Vec2::new(
-                                                    width,
-                                                    TRACK_LANE_HEIGHT,
-                                                ));
-                                            }
-                                        }
+                                            (None, None) => ui.allocate_space(size).1,
+                                        };
+                                        span.get_or_insert((lane.left(), lane.right()));
                                         vmeter(
                                             ui,
                                             &displays,
@@ -1065,12 +1190,136 @@ impl RecrecApp {
                 }
             });
 
+        self.lane_span = span;
+        if let Some(t) = &mut self.open_take {
+            if let Some((factor, anchor)) = zoom {
+                t.zoom_by(factor, anchor, lane_width);
+            }
+            if scroll_px != 0.0 {
+                t.scroll_by(scroll_px, lane_width);
+            }
+        }
+        if let Some(frame) = seek {
+            self.seek(frame);
+        }
         if let Some(i) = remove {
             self.tracks.remove(i);
             changed = true;
         }
         if changed {
             self.tracks_changed();
+        }
+    }
+
+    /// Playback controls of the opened take, shown above its timeline.
+    fn take_toolbar(&mut self, ui: &mut Ui, lane_width: f32) {
+        let Some(take) = &self.open_take else { return };
+        let playing = self.is_playing();
+        let blocker = self.playback_blocker();
+        let rate = f64::from(take.meta.sample_rate.max(1));
+        let clock = format!(
+            "{} / {}",
+            format_duration(self.play_position() as f64 / rate),
+            format_duration(take.duration_secs())
+        );
+        let name = take.name.clone();
+        let mut toggle = false;
+        let mut rewind = false;
+        let mut close = false;
+        let mut append = false;
+        let mut zoom: Option<f64> = None;
+        let mut show_all = false;
+
+        theme::card(theme::RADIUS_MD)
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(blocker.is_none(), |ui| {
+                        let (glyph, tip) = if playing {
+                            (icon::STOP, "停止 (Enter)")
+                        } else {
+                            (icon::PLAY, "再生 (Enter)")
+                        };
+                        toggle = transport_button(ui, glyph, tip, playing).clicked();
+                    });
+                    rewind =
+                        transport_button(ui, icon::SKIP_BACK, "先頭へ (Home)", false).clicked();
+                    ui.label(
+                        RichText::new(clock)
+                            .font(theme::mono(theme::TEXT_BODY))
+                            .color(theme::INK),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        close =
+                            icon_button(ui, icon::X, "テイクを閉じて、入力の波形表示に戻る", false)
+                                .clicked();
+                        append = ui
+                            .add_enabled(self.can_record(), Button::new("続きから録音"))
+                            .on_hover_text(
+                                "このテイクの最後に続けて録音します (つなぎ目にマーカーが入ります)",
+                            )
+                            .clicked();
+                        if ui
+                            .button("全体")
+                            .on_hover_text("テイク全体が収まるように表示")
+                            .clicked()
+                        {
+                            show_all = true;
+                        }
+                        if ui
+                            .button("＋")
+                            .on_hover_text("拡大 (Ctrl + ホイール)")
+                            .clicked()
+                        {
+                            zoom = Some(2.0);
+                        }
+                        if ui
+                            .button("−")
+                            .on_hover_text("縮小 (Ctrl + ホイール)")
+                            .clicked()
+                        {
+                            zoom = Some(0.5);
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let text = blocker.clone().unwrap_or(name);
+                            let color = if blocker.is_some() {
+                                theme::WARN
+                            } else {
+                                theme::INK_SUBTLE
+                            };
+                            ui.add(
+                                Label::new(
+                                    RichText::new(text)
+                                        .font(theme::regular(theme::TEXT_SMALL))
+                                        .color(color),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                });
+            });
+
+        if let Some(t) = &mut self.open_take {
+            if let Some(factor) = zoom {
+                t.zoom_by(factor, lane_width / 2.0, lane_width);
+            }
+            if show_all {
+                t.show_all(lane_width);
+            }
+        }
+        if toggle {
+            self.toggle_play();
+        }
+        if rewind {
+            self.seek(0);
+        }
+        if append {
+            self.append_to_open_take();
+        }
+        if close {
+            self.close_take();
         }
     }
 
@@ -1094,6 +1343,7 @@ impl RecrecApp {
         let mut drag: Option<Vec<PathBuf>> = None;
         let mut open: Option<PathBuf> = None;
         let mut edit: Option<PathBuf> = None;
+        let mut listen: Option<PathBuf> = None;
         let mut refresh = false;
 
         ui.horizontal(|ui| {
@@ -1148,9 +1398,22 @@ impl RecrecApp {
                     );
                 }
                 for take in &self.takes {
-                    take_card(ui, take, &mut drag, &mut open, &mut edit);
+                    let is_open = self.open_take.as_ref().is_some_and(|t| t.dir == take.dir);
+                    take_card(
+                        ui,
+                        take,
+                        is_open,
+                        &mut drag,
+                        &mut open,
+                        &mut edit,
+                        &mut listen,
+                    );
                 }
             });
+
+        if let Some(dir) = listen {
+            self.open_take(&dir);
+        }
 
         if let Some(dir) = edit
             && let Some(take) = self.takes.iter().find(|t| t.dir == dir).cloned()
@@ -1293,7 +1556,7 @@ impl RecrecApp {
         ui.horizontal(|ui| {
             ui.label(theme::with_icon(
                 icon::KEYBOARD,
-                "Space で録音 / 停止  ·  M でマーカー",
+                "Space 録音/停止  ·  P 一時停止  ·  M マーカー  ·  Enter 再生/停止",
                 theme::regular(theme::TEXT_SMALL),
                 theme::INK_TERTIARY,
             ));
@@ -1406,9 +1669,11 @@ impl RecrecApp {
 fn take_card(
     ui: &mut Ui,
     take: &TakeEntry,
+    is_open: bool,
     drag: &mut Option<Vec<PathBuf>>,
     open: &mut Option<PathBuf>,
     edit: &mut Option<PathBuf>,
+    listen: &mut Option<PathBuf>,
 ) {
     let id = Id::unique(("take", &take.dir));
     let can_drag = platform::file_drag_supported() && !take.in_progress;
@@ -1426,7 +1691,11 @@ fn take_card(
         theme::card(theme::RADIUS_MD)
             .stroke(Stroke::new(
                 1.0,
-                theme::mix(theme::HAIRLINE, theme::HAIRLINE_STRONG, hover),
+                if is_open {
+                    theme::INK_SUBTLE
+                } else {
+                    theme::mix(theme::HAIRLINE, theme::HAIRLINE_STRONG, hover)
+                },
             ))
             .inner_margin(Margin::same(12))
             .show(ui, |ui| {
@@ -1465,6 +1734,11 @@ fn take_card(
                         if icon_button(ui, icon::FOLDER_OPEN, "フォルダを開く", false).clicked()
                         {
                             *open = Some(take.dir.clone());
+                        }
+                        if !take.in_progress
+                            && icon_button(ui, icon::PLAY, "開いて聴き直す", false).clicked()
+                        {
+                            *listen = Some(take.dir.clone());
                         }
                         if !take.in_progress
                             && icon_button(
