@@ -737,10 +737,11 @@ mod tests {
         }
     }
 
-    /// Decodes float samples from the data chunk (the last chunk in our layout).
+    /// Decodes float samples from the data chunk. Nothing before it contains "data"
+    /// (a cue chunk after it does, hence the search from the front).
     fn read_float_wav(path: &Path) -> Vec<f32> {
         let bytes = fs::read(path).unwrap();
-        let at = bytes.windows(4).rposition(|w| w == b"data").unwrap();
+        let at = bytes.windows(4).position(|w| w == b"data").unwrap();
         let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
         bytes[at + 8..at + 8 + size]
             .as_chunks::<4>()
