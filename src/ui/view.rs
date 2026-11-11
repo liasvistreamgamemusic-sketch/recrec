@@ -38,6 +38,8 @@ const DB_READOUT_WIDTH: f32 = 46.0;
 /// The waveform lanes show the last 10 seconds.
 const WAVE_WINDOW_BLOCKS: usize = 10 * waveform::BLOCKS_PER_SECOND as usize;
 const EDIT_DIALOG_WIDTH: f32 = 380.0;
+/// Width of the clock and summary beside the record button (fits "1:23:45.6").
+const CLOCK_COLUMN_WIDTH: f32 = 340.0;
 const SCROLL_BAR_GUTTER: f32 = 10.0;
 const MAX_TOASTS: usize = 3;
 const TOAST_WIDTH: f32 = 380.0;
@@ -610,6 +612,8 @@ impl RecrecApp {
             ))
             .inner_margin(Margin::same(24))
             .show(ui, |ui| {
+                // Always span the column: the card must not resize with its contents.
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.set_min_height(RECORD_BUTTON_SIZE + 16.0);
                     ui.add_space(theme::SPACE_XS);
@@ -618,6 +622,9 @@ impl RecrecApp {
                     }
                     ui.add_space(theme::SPACE_LG);
                     ui.vertical(|ui| {
+                        // Fixed width, so the summary line (which grows when the metronome
+                        // is on) cannot push the take-name field around.
+                        ui.set_width(CLOCK_COLUMN_WIDTH);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         self.transport_state(ui, recording, rec_t);
                         // While counting in, the clock shows bars to go and the beat.
@@ -630,10 +637,13 @@ impl RecrecApp {
                                 .font(theme::mono(theme::TEXT_TIMER))
                                 .color(theme::mix(theme::INK_MUTED, theme::INK, rec_t)),
                         );
-                        ui.label(
-                            RichText::new(self.take_summary())
-                                .font(theme::regular(theme::TEXT_SMALL))
-                                .color(theme::INK_SUBTLE),
+                        ui.add(
+                            Label::new(
+                                RichText::new(self.take_summary())
+                                    .font(theme::regular(theme::TEXT_SMALL))
+                                    .color(theme::INK_SUBTLE),
+                            )
+                            .truncate(),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
