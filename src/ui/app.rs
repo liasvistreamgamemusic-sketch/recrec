@@ -13,10 +13,12 @@ use crate::audio::devices::{self, DeviceInfo};
 use crate::audio::stream::InputSession;
 use crate::config::{self, AppConfig};
 use crate::meter::MeterDisplay;
+use crate::metronome::{self, TapTempo};
 use crate::platform::SleepGuard;
 use crate::recorder::{RecorderEvent, TakeRequest, TrackRequest};
-use crate::take::{self, TakeEntry};
+use crate::take::{self, TakeEntry, Tempo};
 use crate::track::{self, Track};
+use crate::transport::{MAX_BPM, MIN_BPM};
 use crate::update::{self, Release, UpdateError};
 
 const CONFIG_SAVE_DELAY: Duration = Duration::from_secs(1);
@@ -65,6 +67,34 @@ enum UpdateEvent {
     Downloaded(Result<PathBuf, UpdateError>),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CountIn {
+    /// Output frame of the first count-in beat.
+    origin_out: u64,
+    total_beats: u32,
+}
+
+/// What the transport shows while counting in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CountInBeat {
+    /// Bars still to go, including the current one.
+    pub bars_left: u32,
+    /// 1-based beat in the bar.
+    pub beat: u32,
+}
+
+/// The take being renamed, annotated or deleted in the edit dialog.
+#[derive(Debug, Clone)]
+pub(super) struct TakeEdit {
+    pub dir: PathBuf,
+    pub label: String,
+    pub note: String,
+    pub confirm_delete: bool,
+}
+
+/// Lead time between pressing record and the first beat, so the click starts cleanly.
+const START_LEAD_SECONDS: f64 = 0.05;
+
 pub struct RecrecApp {
     pub(super) config: AppConfig,
     config_path: Option<PathBuf>,
@@ -87,10 +117,16 @@ pub struct RecrecApp {
     pub(super) messages: Vec<Message>,
     pub(super) free_space: Option<u64>,
     pub(super) total_space: Option<u64>,
-    /// Horizontal extent of the track meters in the last frame (aligns the dB scale).
-    pub(super) meter_span: Option<(f32, f32)>,
     last_space_check: Option<Instant>,
     pub(super) pending_drag: Option<Vec<PathBuf>>,
+    tap: TapTempo,
+    /// Set while a counted-in start is waiting for its bar line.
+    count_in: Option<CountIn>,
+    /// Waveform block at which the current take began (colors the recorded part).
+    pub(super) rec_wave_start: Option<u64>,
+    /// Waveform blocks of the markers dropped in the current take.
+    pub(super) marker_blocks: Vec<u64>,
+    pub(super) take_edit: Option<TakeEdit>,
     pub(super) update: UpdateState,
     /// Events of the running update thread, if any.
     update_rx: Option<Receiver<UpdateEvent>>,
@@ -134,9 +170,13 @@ impl RecrecApp {
             messages: Vec::new(),
             free_space: None,
             total_space: None,
-            meter_span: None,
             last_space_check: None,
             pending_drag: None,
+            tap: TapTempo::default(),
+            count_in: None,
+            rec_wave_start: None,
+            marker_blocks: Vec::new(),
+            take_edit: None,
             update: UpdateState::Idle,
             update_rx: None,
             self_update_supported: crate::platform::is_installed_build()
@@ -274,6 +314,14 @@ impl RecrecApp {
         match InputSession::open(self.host, &info.name, rate, buffer) {
             Ok(session) => {
                 session.recorder().set_preroll(self.config.preroll_secs);
+                // Bar 1 starts when the stream does; a counted-in take moves it.
+                session.transport.set_origin_out(0);
+                if let Some(e) = &session.output_error {
+                    self.push(
+                        Level::Warn,
+                        format!("音を出せないため、メトロノームとモニターは使えません: {e}"),
+                    );
+                }
                 self.meters = vec![MeterDisplay::default(); usize::from(session.info.channels)];
                 self.session = Some(session);
             }
@@ -298,11 +346,23 @@ impl RecrecApp {
                 "保存されていたトラックの一部がこのデバイスに無い入力を指していたため外しました",
             );
         }
+        let names = self.channel_names(channels);
         self.tracks = if valid.is_empty() {
-            track::default_tracks(channels)
+            track::default_tracks_for(&names)
         } else {
             valid
         };
+        if track::mark_loopback(&mut self.tracks, &names) {
+            self.tracks_changed();
+        }
+    }
+
+    /// Input channel names of the open device ("In N" when there is none).
+    fn channel_names(&self, channels: u16) -> Vec<String> {
+        self.session
+            .as_ref()
+            .map(|s| s.info.channel_names.clone())
+            .unwrap_or_else(|| track::fallback_names(channels))
     }
 
     pub(super) fn select_host(&mut self, host: HostId) {
@@ -369,7 +429,7 @@ impl RecrecApp {
 
     pub(super) fn reset_tracks(&mut self) {
         if let Some(s) = &self.session {
-            self.tracks = track::default_tracks(s.info.channels);
+            self.tracks = track::default_tracks_for(&s.info.channel_names);
             self.tracks_changed();
         }
     }
@@ -386,6 +446,8 @@ impl RecrecApp {
             .unwrap_or(0);
         let mut t = Track::mono(channel);
         t.name = format!("Track{}", self.tracks.len() + 1);
+        // Follow the monitoring choice of the existing tracks.
+        t.monitor = self.tracks.iter().any(|t| t.monitor);
         self.tracks.push(t);
         self.tracks_changed();
     }
@@ -420,6 +482,7 @@ impl RecrecApp {
             return;
         }
         let Some(session) = &self.session else { return };
+        let (start_at, tempo, count_in) = self.plan_start(session);
         let request = TakeRequest {
             root: self.config.output_dir(),
             label: self.take_label.trim().to_owned(),
@@ -435,10 +498,164 @@ impl RecrecApp {
             format: self.config.format,
             host: session.info.host.clone(),
             device: session.info.device.clone(),
+            start_at,
+            tempo,
+            skip_silent: self.config.skip_silent_tracks,
         };
         self.dropped_at_take_start = session.dropped_frames();
         session.recorder().start(request);
         self.start_pending = true;
+        self.count_in = count_in;
+        if tempo.is_some() && self.tracks.iter().any(|t| t.armed && t.loopback) {
+            self.push(
+                Level::Warn,
+                "ループバックの印が付いたトラックを録音しています。メトロノームの音も録音されます",
+            );
+        }
+    }
+
+    /// With the metronome on, a take starts on a bar line (after the count-in, if any).
+    fn plan_start(&self, session: &InputSession) -> (Option<u64>, Option<Tempo>, Option<CountIn>) {
+        let m = &self.config.metronome;
+        if !m.enabled || !session.has_output() {
+            return (None, None, None);
+        }
+        let rate = f64::from(session.info.sample_rate);
+        let lead = (rate * START_LEAD_SECONDS) as u64;
+        let total_beats = m.count_in_bars * m.beats_per_bar;
+        let beat = metronome::beat_frames(session.info.sample_rate, m.bpm, m.beat_unit);
+        let count_in_frames = (f64::from(total_beats) * beat).round() as u64;
+        let comp = (f64::from(self.config.latency_comp_ms) / 1000.0 * rate).round() as i64;
+
+        let t = &session.transport;
+        let origin_out = t.out_frames() + lead;
+        t.set_origin_out(origin_out);
+        let start_at = (t.in_frames() + lead + count_in_frames).saturating_add_signed(comp);
+        let tempo = Tempo {
+            bpm: m.bpm,
+            beats_per_bar: m.beats_per_bar,
+            beat_unit: m.beat_unit,
+            count_in_bars: m.count_in_bars,
+        };
+        let count_in = (total_beats > 0).then_some(CountIn {
+            origin_out,
+            total_beats,
+        });
+        (Some(start_at), Some(tempo), count_in)
+    }
+
+    /// The beat being counted in right now, if a counted-in start is pending.
+    pub(super) fn count_in_beat(&self) -> Option<CountInBeat> {
+        let c = self.count_in?;
+        let s = self.session.as_ref()?;
+        let m = &self.config.metronome;
+        let since = s.transport.out_frames().saturating_sub(c.origin_out);
+        let beat = metronome::beat_frames(s.info.sample_rate, m.bpm, m.beat_unit);
+        let index = ((since as f64 / beat) as u32).min(c.total_beats.saturating_sub(1));
+        let per_bar = m.beats_per_bar.max(1);
+        Some(CountInBeat {
+            bars_left: (c.total_beats - index).div_ceil(per_bar),
+            beat: index % per_bar + 1,
+        })
+    }
+
+    /// Position inside the bar (`beat`, 0-based, and how far into the beat, 0..1) while the
+    /// click is running. Drives the beat lights.
+    pub(super) fn beat_phase(&self) -> Option<(u32, f32)> {
+        let s = self.session.as_ref()?;
+        if !s.transport.click_on() {
+            return None;
+        }
+        let since = s
+            .transport
+            .out_frames()
+            .checked_sub(s.transport.origin_out()?)?;
+        let m = &self.config.metronome;
+        let beat = metronome::beat_frames(s.info.sample_rate, m.bpm, m.beat_unit);
+        let pos = metronome::position(since, beat, m.beats_per_bar);
+        Some((pos.beat, (pos.offset / beat) as f32))
+    }
+
+    /// Whether the app can play sound at all (false: metronome and monitoring are disabled).
+    pub(super) fn has_output(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.has_output())
+    }
+
+    pub(super) fn tap_tempo(&mut self) {
+        if let Some(bpm) = self.tap.tap(Instant::now()) {
+            self.config.metronome.bpm = (bpm.clamp(MIN_BPM, MAX_BPM) * 10.0).round() / 10.0;
+            self.mark_dirty();
+        }
+    }
+
+    pub(super) fn add_marker(&mut self) {
+        if self.recording_dir.is_none() {
+            return;
+        }
+        if let Some(s) = &self.session {
+            s.recorder().add_marker();
+            self.marker_blocks.push(s.waves.total_blocks());
+        }
+    }
+
+    /// Pushes the metronome, click and monitor settings to the audio callbacks.
+    fn sync_transport(&self) {
+        let Some(s) = &self.session else { return };
+        let m = &self.config.metronome;
+        let t = &s.transport;
+        t.set_tempo(m.bpm, m.beats_per_bar, m.beat_unit);
+        let recording = self.recording_dir.is_some();
+        let click = m.enabled
+            && (self.count_in.is_some()
+                || (recording && m.click_while_recording)
+                || (!self.is_busy() && m.click_while_idle));
+        t.set_click(click, m.volume.clamp(0.0, 1.0));
+        t.set_master_gain(self.config.output_volume.clamp(0.0, 1.0));
+        t.set_channel_gains(&track::monitor_gains(&self.tracks, t.in_channels()));
+    }
+
+    pub(super) fn begin_take_edit(&mut self, take: &TakeEntry) {
+        self.take_edit = Some(TakeEdit {
+            dir: take.dir.clone(),
+            label: take::label_of(&take.name).to_owned(),
+            note: take
+                .meta
+                .as_ref()
+                .map(|m| m.note.clone())
+                .unwrap_or_default(),
+            confirm_delete: false,
+        });
+    }
+
+    /// Applies the edit dialog: renames the folder and stores the note.
+    pub(super) fn save_take_edit(&mut self) {
+        let Some(edit) = self.take_edit.take() else {
+            return;
+        };
+        match take::rename_take(&edit.dir, &edit.label) {
+            Ok(dir) => {
+                if let Err(e) = take::set_note(&dir, &edit.note) {
+                    self.push(Level::Error, format!("メモを保存できません: {e}"));
+                }
+            }
+            Err(e) => self.push(Level::Error, format!("テイク名を変更できません: {e}")),
+        }
+        self.refresh_takes();
+    }
+
+    /// Moves the take in the edit dialog to the Recycle Bin.
+    pub(super) fn delete_edited_take(&mut self) {
+        let Some(edit) = self.take_edit.take() else {
+            return;
+        };
+        match crate::platform::move_to_trash(&edit.dir) {
+            Ok(()) => self.push(
+                Level::Info,
+                format!("ごみ箱に移動しました: {}", edit.dir.display()),
+            ),
+            Err(e) => self.push(Level::Error, format!("ごみ箱に移動できません: {e}")),
+        }
+        self.refresh_takes();
     }
 
     fn stop_recording(&mut self) {
@@ -449,14 +666,24 @@ impl RecrecApp {
 
     fn handle_recorder_event(&mut self, event: RecorderEvent) {
         match event {
+            RecorderEvent::Cancelled => {
+                self.start_pending = false;
+                self.count_in = None;
+                self.push(Level::Info, "カウントインを中止しました");
+            }
             RecorderEvent::Started { dir } => {
                 self.start_pending = false;
+                self.count_in = None;
+                self.rec_wave_start = self.session.as_ref().map(|s| s.waves.total_blocks());
+                self.marker_blocks.clear();
                 self.sleep_guard = Some(SleepGuard::new());
                 self.push(Level::Info, format!("録音開始: {}", dir.display()));
                 self.recording_dir = Some(dir);
             }
             RecorderEvent::Stopped(summary) => {
                 self.start_pending = false;
+                self.count_in = None;
+                self.rec_wave_start = None;
                 self.recording_dir = None;
                 self.sleep_guard = None;
                 let secs = self.session.as_ref().map_or(0.0, |s| {
@@ -480,6 +707,15 @@ impl RecrecApp {
                     Level::Warn
                 };
                 self.push(level, text);
+                if !summary.skipped_silent.is_empty() {
+                    self.push(
+                        Level::Info,
+                        format!(
+                            "無音だったため保存しなかったトラック: {}",
+                            summary.skipped_silent.join(", ")
+                        ),
+                    );
+                }
                 for e in summary.errors {
                     self.push(Level::Error, e);
                 }
@@ -487,6 +723,7 @@ impl RecrecApp {
             }
             RecorderEvent::Error(msg) => {
                 self.start_pending = false;
+                self.count_in = None;
                 self.push(Level::Error, msg);
             }
         }
@@ -516,6 +753,11 @@ impl RecrecApp {
                 "デバイスとの接続に問題があります。⟳ で再接続してください ({})",
                 stream_errors.join(" / ")
             ));
+        }
+
+        self.sync_transport();
+        if let Some(s) = &mut self.session {
+            s.poll_waveform();
         }
 
         let dt = self.last_meter_time.map_or(0.0, |t| (now - t) as f32);

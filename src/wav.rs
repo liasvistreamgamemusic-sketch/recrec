@@ -212,7 +212,7 @@ impl WavWriter {
             &self.layout,
             &self.spec,
             self.data_bytes,
-            false,
+            0,
             self.rf64,
             self.rf64_threshold,
         )?;
@@ -228,6 +228,12 @@ impl WavWriter {
 
     /// Writes the pad byte and final sizes, then syncs. Safe to call more than once.
     pub fn finalize(&mut self) -> io::Result<()> {
+        self.finalize_with_cues(&[])
+    }
+
+    /// Like [`Self::finalize`], and stores `cues` (frame positions) as WAV cue points so DAWs
+    /// show them as markers.
+    pub fn finalize_with_cues(&mut self, cues: &[u64]) -> io::Result<()> {
         if self.finalized {
             return Ok(());
         }
@@ -235,15 +241,17 @@ impl WavWriter {
         let padded = self.data_bytes % 2 == 1;
         if padded {
             self.out.write_all(&[0])?;
-            self.out.flush()?;
         }
+        let cue = cue_chunk(cues);
+        self.out.write_all(&cue)?;
+        self.out.flush()?;
         let file = self.out.get_mut();
         self.rf64 = write_sizes(
             file,
             &self.layout,
             &self.spec,
             self.data_bytes,
-            padded,
+            u64::from(padded) + cue.len() as u64,
             self.rf64,
             self.rf64_threshold,
         )?;
@@ -266,6 +274,28 @@ impl Drop for WavWriter {
             log::error!("failed to finalize WAV file on drop: {e}");
         }
     }
+}
+
+/// A `cue ` chunk for the given frame positions (empty when there are none). Positions that
+/// do not fit the format's 32-bit field are left out.
+fn cue_chunk(cues: &[u64]) -> Vec<u8> {
+    let points: Vec<u32> = cues.iter().filter_map(|c| u32::try_from(*c).ok()).collect();
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut chunk = Vec::with_capacity(12 + points.len() * 24);
+    chunk.extend_from_slice(b"cue ");
+    chunk.extend_from_slice(&(4 + points.len() as u32 * 24).to_le_bytes());
+    chunk.extend_from_slice(&(points.len() as u32).to_le_bytes());
+    for (id, position) in points.iter().enumerate() {
+        chunk.extend_from_slice(&(id as u32 + 1).to_le_bytes());
+        chunk.extend_from_slice(&position.to_le_bytes());
+        chunk.extend_from_slice(b"data");
+        chunk.extend_from_slice(&0u32.to_le_bytes()); // chunk start
+        chunk.extend_from_slice(&0u32.to_le_bytes()); // block start
+        chunk.extend_from_slice(&position.to_le_bytes()); // sample offset
+    }
+    chunk
 }
 
 fn encode_i24(x: f32) -> i32 {
@@ -363,11 +393,11 @@ fn write_sizes(
     layout: &Layout,
     spec: &WavSpec,
     data_bytes: u64,
-    padded: bool,
+    trailing_bytes: u64,
     already_rf64: bool,
     rf64_threshold: u64,
 ) -> io::Result<bool> {
-    let riff_size = layout.data_start + data_bytes + u64::from(padded) - 8;
+    let riff_size = layout.data_start + data_bytes + trailing_bytes - 8;
     let frames = data_bytes / u64::from(spec.block_align());
     let rf64 = already_rf64 || riff_size > rf64_threshold;
 
@@ -518,7 +548,7 @@ pub fn repair(path: &Path) -> io::Result<Repaired> {
         &scanned.layout,
         &spec,
         data_bytes,
-        padded,
+        u64::from(padded),
         scanned.rf64,
         u64::from(u32::MAX),
     )?;
@@ -742,6 +772,28 @@ mod tests {
         assert_eq!(u64_at(&bytes, 28), 1200);
         assert_eq!(u64_at(&bytes, 36), 400);
         assert_eq!(data_of(&path).len(), 1200);
+    }
+
+    #[test]
+    fn cue_points_follow_the_audio_and_are_counted_in_the_riff_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        let mut w = WavWriter::create(&path, spec(1, SampleFormat::Pcm24), &bext(), 0).unwrap();
+        w.write_samples(&[0.1, 0.2, 0.3]).unwrap(); // 9 bytes: needs a pad byte
+        w.finalize_with_cues(&[1, 2]).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let s = scan_path(&path);
+        assert_eq!(data_of(&path).len(), 9);
+        let cue = s.layout.data_start + 10;
+        assert_eq!(&bytes[cue as usize..cue as usize + 4], b"cue ");
+        assert_eq!(u32_at(&bytes, cue + 4), 4 + 2 * 24);
+        assert_eq!(u32_at(&bytes, cue + 8), 2);
+        assert_eq!(u32_at(&bytes, cue + 12), 1); // first id
+        assert_eq!(u32_at(&bytes, cue + 16), 1); // first position
+        assert_eq!(u32_at(&bytes, cue + 36 + 4), 2); // second position
+        assert_eq!(u32_at(&bytes, 4) as usize, bytes.len() - 8);
+        assert_eq!(bytes.len() as u64, cue + 8 + 4 + 48);
     }
 
     #[test]
