@@ -291,7 +291,9 @@ impl Worker {
                 }
                 for (out, frame) in self
                     .mix
-                    .chunks_exact_mut(2)
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
                     .zip(self.scratch.chunks_exact(channels))
                 {
                     // Mono files go to both sides; stereo files keep their sides.
