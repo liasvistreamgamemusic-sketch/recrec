@@ -9,10 +9,11 @@ use cpal::{BufferSize, HostId, SampleFormat, StreamConfig};
 use crossbeam_channel::Receiver;
 
 use super::capture::{Capture, SUPPORTED_FORMATS, Taps};
-use super::devices;
 use super::output::{self, OutputMixer};
+use super::{channel_names, devices};
 use crate::meter::MeterBank;
 use crate::recorder::{Recorder, RecorderConfig, RecorderEvent};
+use crate::track;
 use crate::transport::Transport;
 use crate::waveform::{BLOCKS_PER_SECOND, WaveHistory};
 
@@ -32,6 +33,8 @@ pub struct SessionInfo {
     pub sample_rate: u32,
     pub device_format: SampleFormat,
     pub buffer_size: Option<u32>,
+    /// Name of every input channel (from the driver, or "In N" when it reports none).
+    pub channel_names: Vec<String>,
 }
 
 pub struct InputSession {
@@ -136,6 +139,8 @@ impl InputSession {
             sample_rate,
             device_format: info.sample_format,
             buffer_size,
+            channel_names: channel_names::asio_input_names(host_id.name(), info.channels)
+                .unwrap_or_else(|| track::fallback_names(info.channels)),
         };
         log::info!("input session opened: {info:?}");
         Ok(Self {

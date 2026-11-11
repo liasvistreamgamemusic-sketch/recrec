@@ -346,11 +346,23 @@ impl RecrecApp {
                 "保存されていたトラックの一部がこのデバイスに無い入力を指していたため外しました",
             );
         }
+        let names = self.channel_names(channels);
         self.tracks = if valid.is_empty() {
-            track::default_tracks(channels)
+            track::default_tracks_for(&names)
         } else {
             valid
         };
+        if track::mark_loopback(&mut self.tracks, &names) {
+            self.tracks_changed();
+        }
+    }
+
+    /// Input channel names of the open device ("In N" when there is none).
+    fn channel_names(&self, channels: u16) -> Vec<String> {
+        self.session
+            .as_ref()
+            .map(|s| s.info.channel_names.clone())
+            .unwrap_or_else(|| track::fallback_names(channels))
     }
 
     pub(super) fn select_host(&mut self, host: HostId) {
@@ -417,7 +429,7 @@ impl RecrecApp {
 
     pub(super) fn reset_tracks(&mut self) {
         if let Some(s) = &self.session {
-            self.tracks = track::default_tracks(s.info.channels);
+            self.tracks = track::default_tracks_for(&s.info.channel_names);
             self.tracks_changed();
         }
     }

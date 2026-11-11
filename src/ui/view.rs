@@ -22,7 +22,7 @@ use crate::metronome;
 use crate::platform;
 use crate::recorder::MAX_PREROLL_SECS;
 use crate::take::TakeEntry;
-use crate::track::{MAX_VOLUME_DB, MIN_VOLUME_DB, Source, Track};
+use crate::track::{self, MAX_VOLUME_DB, MIN_VOLUME_DB, Source, Track};
 use crate::transport::{MAX_BPM, MIN_BPM};
 use crate::wav::SampleFormat;
 use crate::waveform;
@@ -335,13 +335,20 @@ impl RecrecApp {
     fn connection_status(&mut self, ui: &mut Ui) {
         let (color, text) = match (&self.session, &self.session_error) {
             (_, Some(err)) => (theme::REC, err.clone()),
-            (Some(s), None) => (
-                theme::OK,
-                format!(
-                    "接続中 · {} 入力 · {}",
-                    s.info.channels, s.info.device_format
-                ),
-            ),
+            (Some(s), None) => (theme::OK, {
+                let loopback = s
+                    .info
+                    .channel_names
+                    .iter()
+                    .filter(|n| track::is_loopback_name(n))
+                    .count();
+                let physical = usize::from(s.info.channels) - loopback;
+                if loopback > 0 {
+                    format!("接続中 · 入力 {physical} + ループバック {loopback}")
+                } else {
+                    format!("接続中 · {physical} 入力 · {}", s.info.device_format)
+                }
+            }),
             (None, None) => (theme::INK_TERTIARY, "デバイスが開かれていません".to_owned()),
         };
         let busy = self.is_busy();
@@ -807,7 +814,10 @@ impl RecrecApp {
                             ))
                             .frame(false),
                         )
-                        .on_hover_text("入力 1 ch ごとにモノラル 1 トラックの構成に戻します")
+                        .on_hover_text(
+                            "物理入力 1 つにつきモノラル 1 トラックの構成に戻します \
+                             (ループバック入力は含めません)",
+                        )
                         .clicked()
                     {
                         self.reset_tracks();
@@ -816,6 +826,11 @@ impl RecrecApp {
             });
         });
 
+        let fallback_names = track::fallback_names(channels);
+        let names = self
+            .session
+            .as_ref()
+            .map_or(&fallback_names, |s| &s.info.channel_names);
         let grid = self.wave_grid();
         let waves = self.session.as_ref().map(|s| &s.waves);
         let rec_start = self.rec_wave_start;
@@ -912,14 +927,14 @@ impl RecrecApp {
                                             ui.add_enabled_ui(!busy, |ui| {
                                                 let before = t.source;
                                                 ComboBox::from_id_salt(("source", i))
-                                                    .selected_text(t.source.label())
+                                                    .selected_text(t.source.label_with(names))
                                                     .width(TRACK_SOURCE_WIDTH)
                                                     .show_ui(ui, |ui| {
                                                         for s in Source::options(channels) {
                                                             ui.selectable_value(
                                                                 &mut t.source,
                                                                 s,
-                                                                s.label(),
+                                                                s.label_with(names),
                                                             );
                                                         }
                                                     });

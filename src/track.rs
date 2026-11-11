@@ -31,6 +31,20 @@ impl Source {
             .all(|&c| c < usize::from(device_channels))
     }
 
+    /// Label built from the driver's channel names (see [`fallback_names`]).
+    pub fn label_with(&self, names: &[String]) -> String {
+        let name = |c: u16| {
+            names
+                .get(usize::from(c))
+                .cloned()
+                .unwrap_or_else(|| format!("In {}", c + 1))
+        };
+        match *self {
+            Self::Mono(c) => name(c),
+            Self::Stereo(l, r) => format!("{} + {} (ステレオ)", name(l), name(r)),
+        }
+    }
+
     /// Human-facing label with 1-based channel numbers.
     pub fn label(&self) -> String {
         match *self {
@@ -127,6 +141,53 @@ pub fn monitor_gains(tracks: &[Track], in_channels: usize) -> Vec<(f32, f32)> {
         }
     }
     gains
+}
+
+/// Channel names used when the driver does not report any: "In 1", "In 2", …
+pub fn fallback_names(device_channels: u16) -> Vec<String> {
+    (1..=device_channels).map(|n| format!("In {n}")).collect()
+}
+
+/// Whether a driver channel name denotes a loopback input (it carries what the computer
+/// plays instead of a physical input).
+pub fn is_loopback_name(name: &str) -> bool {
+    name.to_lowercase().contains("loop")
+}
+
+/// One armed mono track per physical input. Loopback inputs get no track (they can be added
+/// by hand); if every input looks like a loopback, all of them are used.
+pub fn default_tracks_for(names: &[String]) -> Vec<Track> {
+    let physical = |name: &&String| !is_loopback_name(name);
+    let keep_all = !names.iter().any(|n| physical(&n));
+    names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| keep_all || physical(name))
+        .map(|(c, name)| {
+            let mut t = Track::mono(c as u16);
+            t.name = name.split_whitespace().collect();
+            t.loopback = is_loopback_name(name);
+            t
+        })
+        .collect()
+}
+
+/// Sets the loopback mark on tracks whose source includes a loopback-named channel.
+/// Returns true when a mark was added.
+pub fn mark_loopback(tracks: &mut [Track], names: &[String]) -> bool {
+    let mut changed = false;
+    for t in tracks.iter_mut().filter(|t| !t.loopback) {
+        let is_loopback = t
+            .source
+            .channels()
+            .iter()
+            .any(|c| names.get(*c).is_some_and(|n| is_loopback_name(n)));
+        if is_loopback {
+            t.loopback = true;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// One armed mono track per input channel.
@@ -244,6 +305,69 @@ mod tests {
         let mut expected = Track::mono(0);
         expected.name = "A".into();
         assert_eq!(t, expected);
+    }
+
+    fn motu_names() -> Vec<String> {
+        [
+            "In 1",
+            "In 2",
+            "In 3",
+            "In 4",
+            "Loopback 1",
+            "Loopback 2",
+            "Loop Mix 1",
+            "Loop Mix 2",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn default_tracks_skip_loopback_inputs() {
+        let tracks = default_tracks_for(&motu_names());
+        let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["In1", "In2", "In3", "In4"]);
+        assert_eq!(tracks[3].source, Source::Mono(3));
+        assert!(tracks.iter().all(|t| t.armed && !t.loopback));
+    }
+
+    #[test]
+    fn default_tracks_keep_everything_when_all_inputs_are_loopback() {
+        let names = vec!["Loopback L".to_owned(), "Loopback R".to_owned()];
+        let tracks = default_tracks_for(&names);
+        assert_eq!(tracks.len(), 2);
+        assert!(tracks.iter().all(|t| t.loopback));
+    }
+
+    #[test]
+    fn fallback_names_give_the_same_tracks_as_before() {
+        assert_eq!(default_tracks_for(&fallback_names(3)), default_tracks(3));
+    }
+
+    #[test]
+    fn existing_tracks_on_loopback_channels_get_marked() {
+        let mut tracks = vec![
+            Track::mono(0),
+            Track::mono(4),
+            Track::new("Mix".into(), Source::Stereo(6, 7)),
+        ];
+        assert!(mark_loopback(&mut tracks, &motu_names()));
+        assert_eq!(
+            tracks.iter().map(|t| t.loopback).collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        assert!(!mark_loopback(&mut tracks, &motu_names()));
+    }
+
+    #[test]
+    fn labels_use_driver_names_when_given() {
+        let names = motu_names();
+        assert_eq!(Source::Mono(4).label_with(&names), "Loopback 1");
+        assert_eq!(
+            Source::Stereo(2, 3).label_with(&names),
+            "In 3 + In 4 (ステレオ)"
+        );
+        assert_eq!(Source::Mono(9).label_with(&names), "In 10");
     }
 
     #[test]
