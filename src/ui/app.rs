@@ -732,6 +732,22 @@ impl RecrecApp {
         }
     }
 
+    /// Plays the open take from its beginning (used right after opening it).
+    pub(super) fn play_from_start(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        if let Some(why) = self.playback_blocker() {
+            self.push(Level::Warn, why);
+            return;
+        }
+        let (Some(take), Some(s)) = (&mut self.open_take, &self.session) else {
+            return;
+        };
+        take.playhead = 0;
+        s.player.play(0, None, 0);
+    }
+
     /// Moves the playhead; playback continues from there if it was running.
     pub(super) fn seek(&mut self, frame: u64) {
         let (Some(take), Some(s)) = (&mut self.open_take, &self.session) else {
